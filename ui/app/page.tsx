@@ -81,10 +81,6 @@ export default function Home() {
       .then((r) => r.json())
       .then((j) => {
         if (!cancelled) setDecisions((j.decisions || []).map(normalizeDecision));
-        if (!cancelled) {
-          const latest = (j.decisions || []).map(normalizeDecision)[0];
-          setIsPausedManual(latest?.reason === "paused");
-        }
       })
       .catch(() => {});
 
@@ -92,7 +88,9 @@ export default function Home() {
     es.onmessage = (e) => {
       try {
         const msg = normalizeDecision(JSON.parse(e.data));
-        setIsPausedManual(msg?.reason === "paused");
+        if (msg?.reason === "paused") {
+          setIsPausedManual(true);
+        }
         setDecisions((prev) => {
           const idx = prev.findIndex((d) => d.id === msg.id);
           if (idx >= 0) {
@@ -113,12 +111,19 @@ export default function Home() {
     };
   }, [user]);
 
-  // Live ticker for countdown while paused
+  // Live ticker for countdown while paused; also auto-clear manual pause when expired.
   useEffect(() => {
-    if (!pausedUntilMs) return;
     const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [pausedUntilMs]);
+  }, []);
+
+  useEffect(() => {
+    if (pausedUntilMs && pausedUntilMs <= nowMs) {
+      setIsPausedManual(false);
+      setPausedUntilMs(null);
+      localStorage.removeItem("paused_until");
+    }
+  }, [pausedUntilMs, nowMs]);
 
   const refreshChildren = useCallback(async () => {
     if (!user) return;
@@ -337,7 +342,7 @@ export default function Home() {
     const today = new Date();
     return date.toDateString() === today.toDateString();
   }).length;
-  const isPaused = isPausedManual || latest?.reason === "paused";
+  const isPaused = isPausedManual || (pausedUntilMs !== null && pausedUntilMs > nowMs);
   const timeLeftMs = pausedUntilMs ? Math.max(0, pausedUntilMs - nowMs) : 0;
   const formatCountdown = (ms: number) => {
     if (ms <= 0) return "0s";

@@ -2,12 +2,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Dict, Any, Optional
 from core.db import db
 from core.config import settings
-from core.activity_logger import log_step
+from core.activity_logger import log_step, log_service_event
 from analysis.graph import app_graph, MonitorState
-from policy.engine import PolicyEngine
+from policy.engine import PolicyEngine, _paused_until
 from core.screenshot_store import persist_screenshots_async
 
 class DecisionBus:
@@ -142,6 +143,38 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
         event["id"] = event_id
     else:
         db.update_event_data_json(event_id, event.get("data_json") or "")
+
+    # Global pause gate: short-circuit the pipeline while paused.
+    now_ms = int(time.time() * 1000)
+    paused_until = _paused_until()
+    if paused_until and now_ms < paused_until:
+        log_service_event(
+            "pipeline_bypassed_paused",
+            {"event_id": event_id, "child_id": event.get("child_id"), "paused_until_ms": paused_until},
+        )
+        log_step("event_received", event, {"upgrade": upgrade, "paused": True})
+        decision = {"action": "allow", "reason": "paused", "categories": []}
+        confidence = 1.0
+        decision_id = db.add_decision(
+            event_id,
+            settings.policy_version,
+            decision["action"],
+            decision["reason"],
+            {"categories": decision.get("categories", []), "confidence": confidence},
+        )
+        message = _format_decision_message(
+            decision_id,
+            event,
+            decision,
+            confidence=confidence,
+            need_screenshot=False,
+            headline_result=None,
+            llm_rationale=None,
+        )
+        message["upgrade"] = bool(upgrade)
+        log_step("decision_finalized", event, {"decision": decision, "confidence": confidence, "headline_agent": None})
+        await bus.publish(message)
+        return message
 
     child_id = event.get("child_id")
     profile = db.get_child_profile(child_id) if child_id else None

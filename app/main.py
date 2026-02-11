@@ -143,6 +143,10 @@ async def control_pause(body: PausePayload):
     cur = db.conn.cursor()
     cur.execute("INSERT INTO settings(key,value) VALUES('paused_until', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(until_ms),))
     db.conn.commit()
+    log_service_event(
+        "monitor_paused",
+        {"minutes_requested": minutes, "effective_minutes": horizon_minutes, "paused_until_ms": until_ms},
+    )
     return {"ok": True, "paused_until": until_ms}
 
 @app.post("/v1/control/resume")
@@ -150,6 +154,7 @@ async def control_resume(body: ResumePayload):
     cur = db.conn.cursor()
     cur.execute("DELETE FROM settings WHERE key='paused_until'")
     db.conn.commit()
+    log_service_event("monitor_resumed")
     return {"ok": True}
 
 @app.get("/v1/children")

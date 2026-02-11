@@ -12,6 +12,7 @@ from langchain.schema import HumanMessage, SystemMessage
 
 from core.config import settings
 from core.db import db
+from core import activity_logger
 
 
 class GuardianLearningLoop:
@@ -54,6 +55,24 @@ class GuardianLearningLoop:
         db.set_setting("guardian_feedback", json.dumps(payload))
         db.mark_override_processed([ov["id"] for ov in overrides])
         self.logger.info("Updated guardian feedback using %s overrides", len(overrides))
+        # Mirror the guardian guidance update into the session log for traceability.
+        activity_logger.log_service_event(
+            "guardian_feedback_updated",
+            {
+                "sample_count": len(overrides),
+                "guidance_preview": (merged_guidance or "")[:500],
+                "patterns": merged_patterns[:5],
+            },
+        )
+        # Capture the full stored guidance (trimmed by the session logger if huge).
+        activity_logger.log_service_event(
+            "guardian_feedback_value",
+            {
+                "guidance": merged_guidance,
+                "patterns": merged_patterns,
+                "sample_count": len(overrides),
+            },
+        )
 
     def _infer_guidance(self, overrides: List[Dict[str, Any]]) -> Dict[str, Any]:
         sample_lines = []

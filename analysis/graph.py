@@ -16,7 +16,8 @@ from core.config import settings
 from core.activity_logger import log_agent_step, log_step
 
 HEADLINE_DECISION_THRESHOLD = 0.85
-MAX_LOOPS = 5
+# Limit planner cycles to reduce latency and avoid loop stalls.
+MAX_LOOPS = 3
 
 
 class MonitorState(BaseModel):

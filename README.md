@@ -71,7 +71,7 @@ WatchIt now uses a planner-driven LangGraph instead of a fixed sequence. A `Moni
 **Dynamic flow**
 - Normal event: planner → headline → planner → url_llm → planner → (optional) ocr → planner → policy → END. OCR runs at most once; headline never runs after OCR.
 - Upgrade event (with screenshots): planner forces ocr first, skips headline; flow: planner → ocr → planner → url_llm → planner → policy → END.
-- Loop protection: planner routes to policy after 5 loops.
+- Loop protection: planner routes to policy after 3 loops.
 
 **Why this agentic design matters**
 - **Tool-selection brain:** The planner acts like a conductor, activating only the tools needed (headline, URL/LLM, OCR, or policy) and never re-running OCR/headlines after OCR to save time.
@@ -114,7 +114,7 @@ git clone <your-fork-url> && cd WatchIt
 
 # 3) Launch the API
 source .venv/bin/activate
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --host 127.0.0.1 --port 4849
 ```
 
 When `setup.sh` completes you will have:

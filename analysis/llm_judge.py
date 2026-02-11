@@ -6,6 +6,7 @@ from langchain_ollama import ChatOllama
 from langchain.schema import SystemMessage, HumanMessage
 from core.config import settings
 from core.db import db
+from core import activity_logger
 import logging
 import re
 import json
@@ -120,6 +121,11 @@ class LLMJudge:
             resp = self.client.invoke(msgs)
             raw = resp.content.strip()
             self.logger.debug("Raw LLM response: %s", raw)
+            # Also capture raw responses in the session log for audit/debug.
+            activity_logger.log_service_event(
+                "llm_raw_response",
+                {"model": self.model, "raw": raw[:2000]},
+            )
         except Exception as e:
             self.logger.exception("Error calling Ollama LLM")
             return {
@@ -131,12 +137,12 @@ class LLMJudge:
                 "confidence": 0.0,
             }
 
-        fallback_block = {
-            "is_harmful": True,
-            "categories": ["llm_refusal"],
-            "severity": "medium",
-            "rationale": "LLM refused or returned invalid output; treat as unsafe.",
-            "action": "block",
+        fallback_allow = {
+            "is_harmful": False,
+            "categories": ["llm_parse_error"],
+            "severity": "low",
+            "rationale": "LLM output invalid; defaulting to allow.",
+            "action": "allow",
             "confidence": 0.2,
         }
 
@@ -151,10 +157,10 @@ class LLMJudge:
                     data = json.loads(m.group(0))
                 except Exception as inner_e:
                     self.logger.error("Fallback JSON parse failed: %s", inner_e)
-                    return fallback_block
+                    return fallback_allow
             else:
                 self.logger.error("No JSON object found in response")
-                return fallback_block
+                return fallback_allow
 
         # Validate with Pydantic
         try:
@@ -162,3 +168,4 @@ class LLMJudge:
             return result
         except Exception as e:
             self.logger.error("Validation failed: %s. Data: %s", e, data)
+            return fallback_allow
