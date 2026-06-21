@@ -1,0 +1,12 @@
+{
+  "name": "watchit",
+  "private": true,
+  "workspaces": [
+    "apps/dashboard"
+  ],
+  "scripts": {
+    "dashboard:dev": "npm --workspace @watchit/dashboard run dev",
+    "dashboard:build": "npm --workspace @watchit/dashboard run build",
+    "dashboard:start": "npm --workspace @watchit/dashboard run start"
+  }
+}

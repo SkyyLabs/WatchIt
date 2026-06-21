@@ -13,21 +13,22 @@ __pycache__/
 .venv/
 venv/
 env/
+node_modules/
 
 # Logs and runtime files
 logs/
 *.log
+screenshots/
+.paddleocr_cache/
+env_file
 
 # Local databases or cache files
 *.sqlite3
 *.db
 
 # Build / analysis outputs
-analysis/__pycache__/
-analysis/agents/__pycache__/
-analysis/agents/tmp/
-runtime/__pycache__/
-core/__pycache__/
+services/agent-worker/src/watchit_agents/agents/tmp/
+*.egg-info/
 
 # OS files
 .DS_Store
@@ -38,22 +39,22 @@ core/__pycache__/
 # ==========================
 
 # Dependencies and builds
-ui/node_modules/
-ui/.next/
-ui/.turbo/
-ui/out/
-ui/dist/
-ui/.vercel/
+apps/dashboard/node_modules/
+apps/dashboard/.next/
+apps/dashboard/.turbo/
+apps/dashboard/out/
+apps/dashboard/dist/
+apps/dashboard/.vercel/
 
 # Environment files
-ui/.env
-ui/.env.local
-ui/.env.development
-ui/.env.production
+apps/dashboard/.env
+apps/dashboard/.env.local
+apps/dashboard/.env.development
+apps/dashboard/.env.production
 
 # Optional editor caches
-ui/.eslintcache
-ui/.stylelintcache
+apps/dashboard/.eslintcache
+apps/dashboard/.stylelintcache
 
 # ==========================
 # OTHERS
@@ -71,4 +72,3 @@ test_output/
 *.pem
 *.key
 *.crt
-

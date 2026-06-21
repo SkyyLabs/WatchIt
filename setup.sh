@@ -43,4 +43,5 @@ ollama pull llama3.1
 
 echo "==> All set!"
 echo "- Activate your venv with: source .venv/bin/activate"
-echo "- Run backend (example): uvicorn app.main:app --reload"
+echo "- Run API (example): make run-api"
+echo "- Run dashboard (example): make run-dashboard"

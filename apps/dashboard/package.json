@@ -1,0 +1,20 @@
+{
+  "name": "@watchit/dashboard",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 4848",
+    "build": "next build",
+    "start": "next start -p 4848"
+  },
+  "dependencies": {
+    "@clerk/nextjs": "^7.5.7",
+    "next": "^16.2.9",
+    "pino": "^10.3.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.3",
+    "typescript": "5.9.3"
+  }
+}

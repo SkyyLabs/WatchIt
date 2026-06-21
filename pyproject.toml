@@ -5,25 +5,39 @@ description = "Local parental monitoring with agentic LLM judge (Ollama)"
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.111,<1",
+  "uvicorn[standard]>=0.30,<1",
   "hypercorn>=0.16",
   "uvloop>=0.19; platform_system!='Windows'",
   "pydantic>=2.6,<3",
   "pydantic-settings>=2.4,<3",
+  "PyJWT[crypto]>=2.8,<3",
   "orjson>=3.10",
   "python-dotenv>=1.0",
+  "structlog>=24.1,<25",
   "httpx>=0.27",
   "sse-starlette>=2.1.0",
   "langchain>=0.2.7,<0.3",
+  "langchain-anthropic>=0.1.20,<0.2",
   "langchain-community>=0.2.7,<0.3",
+  "langchain-ollama>=0.1.0,<0.2",
+  "langchain-openai>=0.1.17,<0.2",
   "langgraph>=0.2.30,<0.3",
 
-  # SQLCipher
-  "pysqlcipher3-binary>=1.0.4",
-
   # OCR (PaddleOCR)
+  "numpy>=1.26,<3",
   "pillow>=10.3",
   "paddleocr>=2.7.0.3",
-  "paddlepaddle==2.6.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
-  "paddlepaddle>=2.5.2; sys_platform == 'darwin' and platform_machine != 'arm64'",
+  "paddlepaddle>=2.6.2,<4; sys_platform == 'darwin'",
   "psycopg[binary]>=3.1",
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = [
+  "apps/api/src",
+  "services/agent-worker/src",
+  "services/learning-worker/src",
+  "packages/core/src",
 ]
