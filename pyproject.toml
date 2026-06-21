@@ -3,6 +3,7 @@ name = "watchit"
 version = "0.2.0"
 description = "Local parental monitoring with agentic LLM judge (Ollama)"
 requires-python = ">=3.10"
+license = "MIT"
 dependencies = [
   "fastapi>=0.111,<1",
   "uvicorn[standard]>=0.30,<1",
