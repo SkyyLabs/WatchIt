@@ -16,7 +16,10 @@
   "background": {
     "service_worker": "background.js"
   },
-  "action": { "default_title": "WatchIt" },
+  "action": {
+    "default_title": "WatchIt",
+    "default_popup": "popup.html"
+  },
   "content_scripts": [{
     "matches": ["<all_urls>"],
     "js": ["content.js"],

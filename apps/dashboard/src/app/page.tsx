@@ -36,6 +36,8 @@ export default function Home() {
   const [decisionSaving, setDecisionSaving] = useState<Record<string, boolean>>({});
   const [isPausedManual, setIsPausedManual] = useState(false);
   const [pausedUntilMs, setPausedUntilMs] = useState<number | null>(null);
+  const [pairingCode, setPairingCode] = useState<string | null>(null);
+  const [monitoringSession, setMonitoringSession] = useState<any>(null);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const esRef = useRef<EventSource | null>(null);
 
@@ -333,6 +335,43 @@ export default function Home() {
     }
   };
 
+  const createPairingCode = async () => {
+    if (!selectedChild) return;
+    const resp = await fetch(`${API}/v1/device/pairing-codes`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(await authHeaders()) },
+      body: JSON.stringify({ child_id: selectedChild, ttl_minutes: 15 }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    setPairingCode(data.pairing_code?.code || null);
+    clientLogger.info("created device pairing code", { child_id: selectedChild });
+  };
+
+  const startMonitoring = async () => {
+    if (!selectedChild) return;
+    const resp = await fetch(`${API}/v1/monitoring/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(await authHeaders()) },
+      body: JSON.stringify({ child_id: selectedChild }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    setMonitoringSession(data.session || null);
+    clientLogger.info("started monitoring", { child_id: selectedChild, session_id: data.session?.id });
+  };
+
+  const stopMonitoring = async () => {
+    const resp = await fetch(`${API}/v1/monitoring/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(await authHeaders()) },
+      body: JSON.stringify({ child_id: selectedChild }),
+    });
+    if (!resp.ok) return;
+    setMonitoringSession(null);
+    clientLogger.info("stopped monitoring", { child_id: selectedChild });
+  };
+
   if (!isLoaded) {
     return (
       <main style={{ padding: 24, fontFamily: "ui-sans-serif" }}>
@@ -525,6 +564,19 @@ export default function Home() {
                     <button onClick={saveChildSettings} disabled={savingChild} style={{ padding: "10px 0", borderRadius: 12, border: "none", background: "#3b82f6", color: "#fff", fontWeight: 600, cursor: "pointer" }}>
                       {savingChild ? "Saving..." : "Save changes"}
                     </button>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                      <button onClick={createPairingCode} style={{ padding: "10px 0", borderRadius: 12, border: "1px solid rgba(148,163,184,.3)", background: "transparent", color: "#e2e8f0", fontWeight: 600, cursor: "pointer" }}>
+                        Pair extension
+                      </button>
+                      <button onClick={monitoringSession ? stopMonitoring : startMonitoring} style={{ padding: "10px 0", borderRadius: 12, border: "none", background: monitoringSession ? "#ef4444" : "#22c55e", color: "#fff", fontWeight: 600, cursor: "pointer" }}>
+                        {monitoringSession ? "Stop monitoring" : "Start monitoring"}
+                      </button>
+                    </div>
+                    {pairingCode && (
+                      <p style={{ margin: 0, padding: 10, borderRadius: 12, background: "rgba(37,99,235,.18)", color: "#bfdbfe", fontSize: 13 }}>
+                        Pairing code: <strong>{pairingCode}</strong>
+                      </p>
+                    )}
                   </div>
                 )}
               </>

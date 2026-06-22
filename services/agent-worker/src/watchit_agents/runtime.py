@@ -9,7 +9,7 @@ from watchit_core.activity_logger import log_step, log_service_event
 from watchit_core.logging import bind_log_context, get_logger
 from watchit_core.url_cache import url_cache_key
 from watchit_agents.graph import app_graph, MonitorState
-from watchit_core.policy.engine import PolicyEngine, _paused_until
+from watchit_core.policy.engine import PolicyEngine
 from watchit_core.screenshot_store import persist_screenshots_async
 
 class DecisionBus:
@@ -59,7 +59,10 @@ def _schedule_screenshot_save(event_id: str, event: Dict[str, Any]) -> None:
         return
     metadata = {
         "event_id": event_id,
+        "household_id": event.get("household_id"),
         "child_id": event.get("child_id"),
+        "device_id": event.get("device_id"),
+        "session_id": event.get("session_id"),
         "ts": event.get("ts"),
         "url": event.get("url"),
         "title": event.get("title"),
@@ -67,7 +70,18 @@ def _schedule_screenshot_save(event_id: str, event: Dict[str, Any]) -> None:
     }
 
     async def _runner():
-        await persist_screenshots_async(event_id, screenshots, metadata)
+        saved = await persist_screenshots_async(event_id, screenshots, metadata)
+        for item in saved:
+            db.insert_screenshot_file(
+                household_id=event.get("household_id") or "hh_legacy",
+                child_id=event.get("child_id"),
+                device_id=event.get("device_id"),
+                event_id=event_id,
+                session_id=event.get("session_id"),
+                local_path=item["local_path"],
+                sha256=item.get("sha256"),
+                size_bytes=item.get("size_bytes"),
+            )
 
     task = asyncio.create_task(_runner())
 
@@ -94,6 +108,9 @@ def _format_decision_message(
     return {
         "decision_id": decision_id,
         "event_id": event.get("id"),
+        "household_id": event.get("household_id"),
+        "device_id": event.get("device_id"),
+        "session_id": event.get("session_id"),
         **decision_payload,
         "upgrade": False,
         "needs_ocr": need_screenshot,
@@ -116,6 +133,9 @@ def _decision_message_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "decision_id": row.get("id"),
         "event_id": row.get("event_id"),
+        "household_id": row.get("household_id"),
+        "device_id": row.get("device_id"),
+        "session_id": row.get("session_id"),
         "tab_id": row.get("tab_id"),
         "action": row.get("action"),
         "reason": row.get("reason"),
@@ -143,8 +163,9 @@ async def publish_decision_row(row: Dict[str, Any]) -> None:
 async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict[str, Any]:
     pipeline_started = time.perf_counter()
     db_started = time.perf_counter()
-    active_child = db.get_active_child_id()
-    if active_child:
+    household_id = event.get("household_id") or "hh_legacy"
+    active_child = db.get_active_child_id(household_id)
+    if active_child and not event.get("device_id"):
         event["child_id"] = active_child
     event_id = event.get("id")
     if not event_id:
@@ -155,13 +176,13 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
     else:
         db.add_event(event)
     db_event_write_ms = _elapsed_ms(db_started)
-    bind_log_context(event_id=event_id, child_id=event.get("child_id"), tab_id=event.get("tab_id"), upgrade=upgrade)
+    bind_log_context(event_id=event_id, household_id=household_id, child_id=event.get("child_id"), tab_id=event.get("tab_id"), upgrade=upgrade)
     logger.info("event_processing_started", url=event.get("url"), db_event_write_ms=db_event_write_ms)
 
     # Global pause gate: short-circuit the pipeline while paused.
     pause_started = time.perf_counter()
     now_ms = int(time.time() * 1000)
-    paused_until = _paused_until()
+    paused_until = db.get_paused_until(household_id)
     pause_check_ms = _elapsed_ms(pause_started)
     if paused_until and now_ms < paused_until:
         log_service_event(
@@ -211,10 +232,10 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
 
     profile_started = time.perf_counter()
     child_id = event.get("child_id")
-    profile = db.get_child_profile(child_id) if child_id else None
+    profile = db.get_child_profile(child_id, household_id) if child_id else None
     if not profile and child_id:
-        db.add_child_profile(child_id)
-        profile = db.get_child_profile(child_id)
+        db.add_child_profile(child_id, household_id=household_id)
+        profile = db.get_child_profile(child_id, household_id)
     if not profile:
         profile = {"id": child_id or "child_default", "strictness": "standard", "age": 12}
     profile_load_ms = _elapsed_ms(profile_started)
@@ -235,7 +256,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
 
     if settings.url_decision_cache_enabled and not upgrade and cache_key:
         cache_started = time.perf_counter()
-        cached = db.get_cached_url_decision(cache_key, settings.url_decision_cache_ttl_seconds)
+        cached = db.get_cached_url_decision(cache_key, settings.url_decision_cache_ttl_seconds, household_id)
         cache_lookup_ms = _elapsed_ms(cache_started)
         if cached:
             details = dict(cached.get("details_json") or {})
@@ -395,6 +416,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
             details=decision_details,
             source_decision_id=decision_id,
             source="pipeline",
+            household_id=household_id,
         )
         cache_write_ms = _elapsed_ms(cache_write_started)
         logger.info(

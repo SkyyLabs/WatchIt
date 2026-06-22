@@ -6,6 +6,7 @@ import jwt
 from fastapi import Header, HTTPException, Query
 
 from watchit_core.config import settings
+from watchit_core.db import db
 from watchit_core.logging import bind_log_context, get_logger
 
 _jwks_client: jwt.PyJWKClient | None = None
@@ -45,11 +46,39 @@ async def require_guardian(authorization: str | None = Header(default=None)) -> 
     if not authorization or not authorization.lower().startswith("bearer "):
         logger.warning("guardian_auth_missing")
         raise HTTPException(401, "Missing bearer token")
-    return verify_clerk_token(authorization.split(" ", 1)[1].strip())
+    claims = verify_clerk_token(authorization.split(" ", 1)[1].strip())
+    context = db.ensure_guardian_household(claims)
+    bind_log_context(
+        guardian_id=context["guardian"].get("id"),
+        household_id=context["household"].get("id"),
+    )
+    return {**claims, **context}
 
 
 async def require_guardian_stream(token: str | None = Query(default=None)) -> Dict[str, Any]:
     if not token:
         logger.warning("guardian_stream_auth_missing")
         raise HTTPException(401, "Missing stream token")
-    return verify_clerk_token(token)
+    claims = verify_clerk_token(token)
+    context = db.ensure_guardian_household(claims)
+    bind_log_context(
+        guardian_id=context["guardian"].get("id"),
+        household_id=context["household"].get("id"),
+    )
+    return {**claims, **context}
+
+
+async def require_device(authorization: str | None = Header(default=None)) -> Dict[str, Any]:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        logger.warning("device_auth_missing")
+        raise HTTPException(401, "Missing device token")
+    device = db.authenticate_device_token(authorization.split(" ", 1)[1].strip())
+    if not device:
+        logger.warning("device_auth_invalid")
+        raise HTTPException(401, "Invalid device token")
+    bind_log_context(
+        device_id=device.get("id"),
+        child_id=device.get("child_id"),
+        household_id=device.get("household_id"),
+    )
+    return {"device": device}

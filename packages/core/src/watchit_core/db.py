@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import secrets
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import psycopg
 from psycopg.rows import dict_row
@@ -11,6 +14,7 @@ from psycopg.types.json import Json
 
 from watchit_core.config import settings
 from watchit_core.migrations import run_migrations
+from watchit_core.url_cache import normalize_url
 
 
 class Database:
@@ -29,134 +33,145 @@ class Database:
         return psycopg.connect(dsn, row_factory=dict_row)
 
     def init_schema(self) -> None:
-        """Legacy fallback for direct schema bootstrap. Prefer Alembic migrations."""
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS watchit_children(
-                    id TEXT PRIMARY KEY,
-                    name TEXT,
-                    os_user TEXT,
-                    timezone TEXT,
-                    strictness TEXT DEFAULT 'standard',
-                    age INTEGER DEFAULT 12,
-                    created_at BIGINT DEFAULT (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS watchit_events(
-                    id TEXT PRIMARY KEY,
-                    child_id TEXT REFERENCES watchit_children(id),
-                    ts BIGINT,
-                    kind TEXT,
-                    url TEXT,
-                    title TEXT,
-                    tab_id TEXT,
-                    referrer TEXT,
-                    data_json JSONB DEFAULT '{}'::jsonb
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS watchit_analysis(
-                    id TEXT PRIMARY KEY,
-                    event_id TEXT REFERENCES watchit_events(id) ON DELETE CASCADE,
-                    model TEXT,
-                    version TEXT,
-                    scores_json JSONB DEFAULT '{}'::jsonb,
-                    label TEXT,
-                    latency_ms BIGINT
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS watchit_decisions(
-                    id TEXT PRIMARY KEY,
-                    event_id TEXT REFERENCES watchit_events(id) ON DELETE CASCADE,
-                    policy_version TEXT,
-                    action TEXT,
-                    reason TEXT,
-                    details_json JSONB DEFAULT '{}'::jsonb,
-                    original_action TEXT,
-                    manual_action TEXT,
-                    manual_flagged BOOLEAN DEFAULT FALSE,
-                    manual_processed BOOLEAN DEFAULT FALSE,
-                    manual_updated_at BIGINT,
-                    created_at TIMESTAMPTZ DEFAULT now()
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS watchit_settings(
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS watchit_event_jobs(
-                    id TEXT PRIMARY KEY,
-                    event_id TEXT,
-                    event_json JSONB NOT NULL,
-                    upgrade BOOLEAN DEFAULT FALSE,
-                    status TEXT DEFAULT 'pending',
-                    attempts INTEGER DEFAULT 0,
-                    error TEXT,
-                    created_at BIGINT,
-                    claimed_at BIGINT,
-                    completed_at BIGINT
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS watchit_url_decision_cache(
-                    cache_key TEXT PRIMARY KEY,
-                    normalized_url TEXT NOT NULL,
-                    child_id TEXT,
-                    strictness TEXT,
-                    age INTEGER,
-                    policy_version TEXT,
-                    action TEXT NOT NULL,
-                    reason TEXT,
-                    details_json JSONB DEFAULT '{}'::jsonb,
-                    source_decision_id TEXT,
-                    source TEXT DEFAULT 'pipeline',
-                    hit_count INTEGER DEFAULT 0,
-                    created_at BIGINT,
-                    updated_at BIGINT
-                )
-                """
-            )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_watchit_events_child_ts ON watchit_events(child_id, ts DESC)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_watchit_decisions_event ON watchit_decisions(event_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_watchit_jobs_status_created ON watchit_event_jobs(status, created_at)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_watchit_url_cache_url ON watchit_url_decision_cache(normalized_url)")
+        """Compatibility wrapper. Schema is owned by Alembic."""
+        run_migrations(self.dsn)
 
-    def add_child_profile(self, child_id: str, name="", os_user="", timezone="", strictness: str = "standard", age: int = 12):
+    @staticmethod
+    def _new_id(prefix: str) -> str:
+        return f"{prefix}_{uuid.uuid4().hex}"
+
+    @staticmethod
+    def _token_hash(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _domain(url: str | None) -> str:
+        if not url:
+            return ""
+        try:
+            host = urlsplit(url).netloc.lower()
+        except Exception:
+            return ""
+        return host[4:] if host.startswith("www.") else host
+
+    def ensure_guardian_household(self, claims: Dict[str, Any]) -> Dict[str, Any]:
+        clerk_user_id = claims.get("sub")
+        if not clerk_user_id:
+            raise RuntimeError("Clerk token is missing subject")
+        email = claims.get("email") or claims.get("primary_email_address")
+        if not email and isinstance(claims.get("email_addresses"), list):
+            email = (claims.get("email_addresses") or [{}])[0].get("email_address")
+        display_name = claims.get("name") or claims.get("full_name") or email or clerk_user_id
+        guardian_id = self._new_id("grd")
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO watchit_children(id, name, os_user, timezone, strictness, age)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO guardians(id, clerk_user_id, email, display_name, last_seen_at)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (clerk_user_id) DO UPDATE SET
+                    email=COALESCE(EXCLUDED.email, guardians.email),
+                    display_name=COALESCE(EXCLUDED.display_name, guardians.display_name),
+                    last_seen_at=now(),
+                    updated_at=now()
+                RETURNING *
+                """,
+                (guardian_id, clerk_user_id, email, display_name),
+            )
+            guardian = cur.fetchone()
+            cur.execute(
+                """
+                SELECT h.*, hm.role
+                FROM households h
+                JOIN household_members hm ON hm.household_id=h.id
+                WHERE hm.guardian_id=%s
+                ORDER BY hm.created_at ASC
+                LIMIT 1
+                """,
+                (guardian["id"],),
+            )
+            household = cur.fetchone()
+            if not household:
+                cur.execute("SELECT id FROM household_members WHERE household_id='hh_legacy' LIMIT 1")
+                legacy_claimed = cur.fetchone()
+                household_id = "hh_legacy" if not legacy_claimed else self._new_id("hh")
+                household_name = "Legacy Household" if household_id == "hh_legacy" else "My Household"
+                cur.execute(
+                    """
+                    INSERT INTO households(id, name)
+                    VALUES (%s, %s)
+                    ON CONFLICT (id) DO UPDATE SET updated_at=now()
+                    RETURNING *
+                    """,
+                    (household_id, household_name),
+                )
+                household = cur.fetchone()
+                cur.execute(
+                    """
+                    INSERT INTO household_members(id, household_id, guardian_id, role)
+                    VALUES (%s, %s, %s, 'owner')
+                    ON CONFLICT (household_id, guardian_id) DO NOTHING
+                    """,
+                    (self._new_id("hm"), household_id, guardian["id"]),
+                )
+            return {"guardian": guardian, "household": household}
+
+    def log_audit(
+        self,
+        household_id: str,
+        action: str,
+        *,
+        guardian_id: Optional[str] = None,
+        device_id: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO audit_log(id, household_id, guardian_id, device_id, action, entity_type, entity_id, metadata_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (self._new_id("aud"), household_id, guardian_id, device_id, action, entity_type, entity_id, Json(metadata or {})),
+            )
+
+    def add_child_profile(
+        self,
+        child_id: str,
+        name: str = "",
+        os_user: str = "",
+        timezone: str = "",
+        strictness: str = "standard",
+        age: int = 12,
+        household_id: str = "hh_legacy",
+    ):
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO children(id, household_id, name, timezone, strictness, age, status)
+                VALUES (%s, %s, %s, %s, %s, %s, 'active')
                 ON CONFLICT (id) DO NOTHING
                 """,
-                (child_id, name, os_user, timezone, strictness, age),
+                (child_id, household_id, name or os_user or "", timezone, strictness, age),
             )
 
-    def get_child_profile(self, child_id: str) -> Optional[Dict[str, Any]]:
+    def get_child_profile(self, child_id: str, household_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT * FROM watchit_children WHERE id=%s", (child_id,))
+            if household_id:
+                cur.execute("SELECT * FROM children WHERE id=%s AND household_id=%s", (child_id, household_id))
+            else:
+                cur.execute("SELECT * FROM children WHERE id=%s", (child_id,))
             return cur.fetchone()
 
-    def update_child_profile(self, child_id: str, strictness: Optional[str] = None, age: Optional[int] = None):
+    def update_child_profile(
+        self,
+        child_id: str,
+        strictness: Optional[str] = None,
+        age: Optional[int] = None,
+        household_id: Optional[str] = None,
+        name: Optional[str] = None,
+        timezone: Optional[str] = None,
+    ):
         updates = []
         params: List[Any] = []
         if strictness is not None:
@@ -165,45 +180,84 @@ class Database:
         if age is not None:
             updates.append("age=%s")
             params.append(age)
+        if name is not None:
+            updates.append("name=%s")
+            params.append(name)
+        if timezone is not None:
+            updates.append("timezone=%s")
+            params.append(timezone)
         if not updates:
             return
+        updates.append("updated_at=now()")
         params.append(child_id)
+        where = "id=%s"
+        if household_id:
+            params.append(household_id)
+            where += " AND household_id=%s"
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(f"UPDATE watchit_children SET {', '.join(updates)} WHERE id=%s", params)
+            cur.execute(f"UPDATE children SET {', '.join(updates)} WHERE {where}", params)
 
-    def fetch_children(self) -> List[Dict[str, Any]]:
+    def fetch_children(self, household_id: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id, name, timezone, strictness, age, created_at FROM watchit_children ORDER BY created_at ASC")
+            if household_id:
+                cur.execute(
+                    """
+                    SELECT id, household_id, name, timezone, strictness, age, status, created_at, updated_at
+                    FROM children
+                    WHERE household_id=%s
+                    ORDER BY created_at ASC
+                    """,
+                    (household_id,),
+                )
+            else:
+                cur.execute("SELECT id, household_id, name, timezone, strictness, age, status, created_at, updated_at FROM children ORDER BY created_at ASC")
             return cur.fetchall()
 
     def add_event(self, event: Dict[str, Any]) -> str:
         event_id = event.get("id") or f"evt_{uuid.uuid4().hex}"
         child_id = event.get("child_id", "child_default")
-        self.add_child_profile(child_id)
+        household_id = event.get("household_id") or "hh_legacy"
+        self.add_child_profile(child_id, household_id=household_id)
+        normalized = normalize_url(event.get("url"))
+        domain = self._domain(normalized or event.get("url"))
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO watchit_events(id, child_id, ts, kind, url, title, tab_id, referrer, data_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO events(
+                    id, household_id, child_id, device_id, session_id, ts, kind, url, normalized_url, domain, title, tab_id, referrer, data_json, raw_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
+                    household_id=EXCLUDED.household_id,
                     child_id=EXCLUDED.child_id,
+                    device_id=EXCLUDED.device_id,
+                    session_id=EXCLUDED.session_id,
                     ts=EXCLUDED.ts,
                     kind=EXCLUDED.kind,
                     url=EXCLUDED.url,
+                    normalized_url=EXCLUDED.normalized_url,
+                    domain=EXCLUDED.domain,
                     title=EXCLUDED.title,
                     tab_id=EXCLUDED.tab_id,
                     referrer=EXCLUDED.referrer,
-                    data_json=EXCLUDED.data_json
+                    data_json=EXCLUDED.data_json,
+                    raw_json=EXCLUDED.raw_json
                 """,
                 (
                     event_id,
+                    household_id,
                     child_id,
+                    event.get("device_id"),
+                    event.get("session_id"),
                     event.get("ts"),
                     event.get("kind"),
                     event.get("url"),
+                    normalized,
+                    domain,
                     event.get("title"),
                     event.get("tab_id"),
                     event.get("referrer"),
+                    Json(self._safe_json(event.get("data_json") or {})),
                     Json(self._safe_json(event.get("data_json") or {})),
                 ),
             )
@@ -214,13 +268,14 @@ class Database:
         event["id"] = event_id
         job_id = f"job_{uuid.uuid4().hex}"
         now_ms = int(time.time() * 1000)
+        household_id = event.get("household_id") or "hh_legacy"
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO watchit_event_jobs(id, event_id, event_json, upgrade, status, attempts, created_at)
-                VALUES (%s, %s, %s, %s, 'pending', 0, %s)
+                INSERT INTO event_jobs(id, household_id, event_id, event_json, upgrade, status, attempts, created_at)
+                VALUES (%s, %s, %s, %s, %s, 'pending', 0, %s)
                 """,
-                (job_id, event_id, Json(event), upgrade, now_ms),
+                (job_id, household_id, event_id, Json(event), upgrade, now_ms),
             )
         return job_id, event_id
 
@@ -231,13 +286,13 @@ class Database:
                 """
                 WITH claimed AS (
                     SELECT id
-                    FROM watchit_event_jobs
+                    FROM event_jobs
                     WHERE status='pending'
                     ORDER BY created_at ASC
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
                 )
-                UPDATE watchit_event_jobs j
+                UPDATE event_jobs j
                 SET status='processing',
                     attempts=attempts + 1,
                     claimed_at=%s
@@ -253,59 +308,71 @@ class Database:
         now_ms = int(time.time() * 1000)
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "UPDATE watchit_event_jobs SET status='completed', completed_at=%s, error=NULL WHERE id=%s",
+                "UPDATE event_jobs SET status='completed', completed_at=%s, error=NULL WHERE id=%s",
                 (now_ms, job_id),
             )
 
     def fail_event_job(self, job_id: str, error: str) -> None:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "UPDATE watchit_event_jobs SET status='failed', error=%s WHERE id=%s",
+                "UPDATE event_jobs SET status='failed', error=%s WHERE id=%s",
                 ((error or "")[:1000], job_id),
             )
 
     def update_event_data_json(self, event_id: str, data_json: str):
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "UPDATE watchit_events SET data_json=%s WHERE id=%s",
-                (Json(self._safe_json(data_json or {})), event_id),
+                "UPDATE events SET data_json=%s, raw_json=%s WHERE id=%s",
+                (Json(self._safe_json(data_json or {})), Json(self._safe_json(data_json or {})), event_id),
             )
 
     def add_analysis(self, event_id: str, model: str, version: str, scores: Dict[str, Any], label: str = "", latency_ms: Optional[int] = None) -> str:
         analysis_id = f"ana_{uuid.uuid4().hex}"
         with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT household_id FROM events WHERE id=%s", (event_id,))
+            event_row = cur.fetchone()
+            household_id = (event_row or {}).get("household_id") or "hh_legacy"
             cur.execute(
                 """
-                INSERT INTO watchit_analysis(id, event_id, model, version, scores_json, label, latency_ms)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO analysis(id, household_id, event_id, model, version, scores_json, label, latency_ms)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (analysis_id, event_id, model, version, Json(scores or {}), label, latency_ms),
+                (analysis_id, household_id, event_id, model, version, Json(scores or {}), label, latency_ms),
             )
         return analysis_id
 
     def add_decision(self, event_id: str, policy_version: str, action: str, reason: str = "", details: Optional[Dict[str, Any]] = None) -> str:
         decision_id = f"dec_{uuid.uuid4().hex}"
         with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT household_id FROM events WHERE id=%s", (event_id,))
+            event_row = cur.fetchone()
+            household_id = (event_row or {}).get("household_id") or "hh_legacy"
             cur.execute(
                 """
-                INSERT INTO watchit_decisions(id, event_id, policy_version, action, reason, details_json, original_action, manual_flagged, manual_processed)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, FALSE)
+                INSERT INTO decisions(id, household_id, event_id, policy_version, action, reason, details_json, original_action)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (decision_id, event_id, policy_version, action, reason, Json(details or {}), action),
+                (decision_id, household_id, event_id, policy_version, action, reason, Json(details or {}), action),
             )
         return decision_id
 
-    def get_cached_url_decision(self, cache_key: str, ttl_seconds: int) -> Optional[Dict[str, Any]]:
+    def get_cached_url_decision(self, cache_key: str, ttl_seconds: int, household_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         min_updated_at = int(time.time() * 1000) - max(0, ttl_seconds) * 1000
         with self._connect() as conn, conn.cursor() as cur:
+            params: List[Any] = [cache_key, min_updated_at]
+            scope = ""
+            if household_id:
+                params.append(household_id)
+                scope = " AND household_id=%s"
             cur.execute(
-                """
-                UPDATE watchit_url_decision_cache
+                f"""
+                UPDATE url_decision_cache
                 SET hit_count=hit_count + 1
                 WHERE cache_key=%s AND updated_at >= %s
+                {scope}
                 RETURNING *
                 """,
-                (cache_key, min_updated_at),
+                params,
             )
             return cur.fetchone()
 
@@ -323,14 +390,18 @@ class Database:
         details: Optional[Dict[str, Any]],
         source_decision_id: Optional[str],
         source: str = "pipeline",
+        household_id: str = "hh_legacy",
     ) -> None:
         now_ms = int(time.time() * 1000)
+        domain = self._domain(normalized_url)
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO watchit_url_decision_cache(
+                INSERT INTO url_decision_cache(
                     cache_key,
+                    household_id,
                     normalized_url,
+                    domain,
                     child_id,
                     strictness,
                     age,
@@ -344,9 +415,11 @@ class Database:
                     created_at,
                     updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s)
                 ON CONFLICT (cache_key) DO UPDATE SET
+                    household_id=EXCLUDED.household_id,
                     normalized_url=EXCLUDED.normalized_url,
+                    domain=EXCLUDED.domain,
                     child_id=EXCLUDED.child_id,
                     strictness=EXCLUDED.strictness,
                     age=EXCLUDED.age,
@@ -360,7 +433,9 @@ class Database:
                 """,
                 (
                     cache_key,
+                    household_id,
                     normalized_url,
+                    domain,
                     child_id,
                     strictness,
                     age,
@@ -375,127 +450,391 @@ class Database:
                 ),
             )
 
-    def get_recent_events(self, child_id: Optional[str], limit: int):
+    def get_recent_events(self, child_id: Optional[str], limit: int, household_id: Optional[str] = None):
         with self._connect() as conn, conn.cursor() as cur:
+            clauses = []
+            params: List[Any] = []
+            if household_id:
+                clauses.append("household_id=%s")
+                params.append(household_id)
             if child_id:
-                cur.execute("SELECT * FROM watchit_events WHERE child_id=%s ORDER BY ts DESC LIMIT %s", (child_id, limit))
-            else:
-                cur.execute("SELECT * FROM watchit_events ORDER BY ts DESC LIMIT %s", (limit,))
+                clauses.append("child_id=%s")
+                params.append(child_id)
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            params.append(limit)
+            cur.execute(f"SELECT * FROM events{where} ORDER BY ts DESC LIMIT %s", params)
             return cur.fetchall()
 
-    def get_recent_decisions(self, child_id: Optional[str], limit: int):
+    def get_recent_decisions(self, child_id: Optional[str], limit: int, household_id: Optional[str] = None):
         base_query = """
             SELECT
                 d.id,
                 d.event_id,
                 d.policy_version,
-                d.action,
+                COALESCE(o.action, d.action) AS action,
                 d.reason,
                 d.details_json,
                 d.original_action,
-                d.manual_action,
-                d.manual_flagged,
-                d.manual_processed,
-                d.manual_updated_at,
+                o.action AS manual_action,
+                (o.id IS NOT NULL) AS manual_flagged,
+                (o.processed_at IS NOT NULL) AS manual_processed,
+                EXTRACT(EPOCH FROM o.created_at) * 1000 AS manual_updated_at,
                 e.tab_id,
                 e.url,
                 e.title,
                 e.ts,
-                e.child_id
-            FROM watchit_decisions d
-            JOIN watchit_events e ON d.event_id = e.id
+                e.child_id,
+                e.household_id
+            FROM decisions d
+            JOIN events e ON d.event_id = e.id
+            LEFT JOIN LATERAL (
+                SELECT *
+                FROM decision_overrides o
+                WHERE o.decision_id=d.id
+                ORDER BY o.created_at DESC
+                LIMIT 1
+            ) o ON TRUE
         """
         with self._connect() as conn, conn.cursor() as cur:
+            clauses = []
+            params: List[Any] = []
+            if household_id:
+                clauses.append("e.household_id=%s")
+                params.append(household_id)
             if child_id:
-                cur.execute(base_query + " WHERE e.child_id=%s ORDER BY e.ts DESC LIMIT %s", (child_id, limit))
-            else:
-                cur.execute(base_query + " ORDER BY e.ts DESC LIMIT %s", (limit,))
+                clauses.append("e.child_id=%s")
+                params.append(child_id)
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            params.append(limit)
+            cur.execute(base_query + where + " ORDER BY e.ts DESC LIMIT %s", params)
             return cur.fetchall()
 
-    def get_decision_with_event(self, decision_id: str) -> Optional[Dict[str, Any]]:
+    def get_decision_with_event(self, decision_id: str, household_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self._connect() as conn, conn.cursor() as cur:
+            params: List[Any] = [decision_id]
+            scope = ""
+            if household_id:
+                params.append(household_id)
+                scope = " AND d.household_id=%s"
             cur.execute(
-                """
-                SELECT d.*, e.url, e.title, e.ts, e.child_id, e.tab_id
-                FROM watchit_decisions d
-                JOIN watchit_events e ON d.event_id=e.id
+                f"""
+                SELECT
+                    d.*,
+                    COALESCE(o.action, d.action) AS action,
+                    o.action AS manual_action,
+                    (o.id IS NOT NULL) AS manual_flagged,
+                    (o.processed_at IS NOT NULL) AS manual_processed,
+                    EXTRACT(EPOCH FROM o.created_at) * 1000 AS manual_updated_at,
+                    e.url, e.title, e.ts, e.child_id, e.tab_id, e.device_id, e.session_id
+                FROM decisions d
+                JOIN events e ON d.event_id=e.id
+                LEFT JOIN LATERAL (
+                    SELECT *
+                    FROM decision_overrides o
+                    WHERE o.decision_id=d.id
+                    ORDER BY o.created_at DESC
+                    LIMIT 1
+                ) o ON TRUE
                 WHERE d.id=%s
+                {scope}
                 """,
-                (decision_id,),
+                params,
             )
             return cur.fetchone()
 
-    def override_decision(self, decision_id: str, new_action: str) -> Optional[Dict[str, Any]]:
-        now_ms = int(time.time() * 1000)
+    def override_decision(
+        self,
+        decision_id: str,
+        new_action: str,
+        household_id: Optional[str] = None,
+        guardian_id: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                """
-                UPDATE watchit_decisions
-                SET action=%s, manual_action=%s, manual_flagged=TRUE, manual_processed=FALSE, manual_updated_at=%s
-                WHERE id=%s
-                """,
-                (new_action, new_action, now_ms, decision_id),
+                "SELECT household_id FROM decisions WHERE id=%s" + (" AND household_id=%s" if household_id else ""),
+                (decision_id, household_id) if household_id else (decision_id,),
             )
-            if cur.rowcount == 0:
+            decision = cur.fetchone()
+            if not decision:
                 return None
-        return self.get_decision_with_event(decision_id)
-
-    def fetch_unprocessed_overrides(self, limit: int = 50) -> List[Dict[str, Any]]:
-        with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT d.*, e.url, e.title, e.ts, e.child_id
-                FROM watchit_decisions d
-                JOIN watchit_events e ON d.event_id = e.id
-                WHERE d.manual_flagged=TRUE AND d.manual_processed=FALSE
-                ORDER BY d.manual_updated_at DESC
+                INSERT INTO decision_overrides(id, household_id, decision_id, guardian_id, action, reason)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (self._new_id("ovr"), decision["household_id"], decision_id, guardian_id, new_action, reason),
+            )
+        return self.get_decision_with_event(decision_id, household_id)
+
+    def fetch_unprocessed_overrides(self, limit: int = 50, household_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            params: List[Any] = []
+            scope = ""
+            if household_id:
+                params.append(household_id)
+                scope = " AND o.household_id=%s"
+            params.append(limit)
+            cur.execute(
+                f"""
+                SELECT o.id AS override_id, o.action AS manual_action, o.processed_at, o.created_at AS manual_updated_at,
+                       d.*, e.url, e.title, e.ts, e.child_id
+                FROM decision_overrides o
+                JOIN decisions d ON o.decision_id=d.id
+                JOIN events e ON d.event_id = e.id
+                WHERE o.processed_at IS NULL
+                {scope}
+                ORDER BY o.created_at DESC
                 LIMIT %s
                 """,
-                (limit,),
+                params,
             )
             return cur.fetchall()
 
-    def mark_override_processed(self, decision_ids: List[str]) -> None:
-        if not decision_ids:
+    def mark_override_processed(self, override_ids: List[str]) -> None:
+        if not override_ids:
             return
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("UPDATE watchit_decisions SET manual_processed=TRUE WHERE id = ANY(%s)", (decision_ids,))
+            cur.execute("UPDATE decision_overrides SET processed_at=now() WHERE id = ANY(%s)", (override_ids,))
 
-    def get_setting(self, key: str) -> Optional[str]:
+    def get_setting(self, key: str, household_id: str = "hh_legacy") -> Optional[str]:
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT value FROM watchit_settings WHERE key=%s", (key,))
+            cur.execute("SELECT value_json FROM household_settings WHERE household_id=%s AND key=%s", (household_id, key))
             row = cur.fetchone()
-            return row["value"] if row else None
+            if not row:
+                return None
+            value_json = row["value_json"] or {}
+            if isinstance(value_json, dict) and "value" in value_json:
+                return str(value_json["value"])
+            return json.dumps(value_json)
 
-    def set_setting(self, key: str, value: str) -> None:
+    def set_setting(self, key: str, value: str, household_id: str = "hh_legacy", guardian_id: Optional[str] = None) -> None:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO watchit_settings(key, value)
-                VALUES (%s, %s)
-                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                INSERT INTO household_settings(id, household_id, key, value_json, updated_by_guardian_id, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (household_id, key) DO UPDATE SET
+                    value_json=EXCLUDED.value_json,
+                    updated_by_guardian_id=EXCLUDED.updated_by_guardian_id,
+                    updated_at=now()
                 """,
-                (key, value),
+                (self._new_id("hset"), household_id, key, Json({"value": value}), guardian_id),
             )
 
-    def delete_setting(self, key: str) -> None:
+    def delete_setting(self, key: str, household_id: str = "hh_legacy") -> None:
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM watchit_settings WHERE key=%s", (key,))
+            cur.execute("DELETE FROM household_settings WHERE household_id=%s AND key=%s", (household_id, key))
 
-    def get_active_child_id(self) -> Optional[str]:
-        return self.get_setting("active_child_id")
+    def get_active_child_id(self, household_id: str = "hh_legacy") -> Optional[str]:
+        return self.get_setting("active_child_id", household_id)
 
-    def set_active_child_id(self, child_id: str) -> None:
-        self.set_setting("active_child_id", child_id)
+    def set_active_child_id(self, child_id: str, household_id: str = "hh_legacy", guardian_id: Optional[str] = None) -> None:
+        self.set_setting("active_child_id", child_id, household_id, guardian_id)
 
-    def get_paused_until(self) -> Optional[int]:
-        value = self.get_setting("paused_until")
+    def get_paused_until(self, household_id: str = "hh_legacy") -> Optional[int]:
+        value = self.get_setting("paused_until", household_id)
         if not value:
             return None
         try:
             return int(value)
         except ValueError:
             return None
+
+    def create_pairing_code(self, household_id: str, child_id: str, guardian_id: str, ttl_minutes: int = 15) -> Dict[str, Any]:
+        code = f"{secrets.randbelow(1000000):06d}"
+        code_hash = self._token_hash(code)
+        row_id = self._new_id("pair")
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO device_pairing_codes(id, household_id, child_id, code_hash, expires_at, created_by_guardian_id)
+                VALUES (%s, %s, %s, %s, now() + (%s || ' minutes')::interval, %s)
+                RETURNING id, household_id, child_id, expires_at, created_at
+                """,
+                (row_id, household_id, child_id, code_hash, ttl_minutes, guardian_id),
+            )
+            row = cur.fetchone()
+        return {**row, "code": code}
+
+    def redeem_pairing_code(
+        self,
+        code: str,
+        *,
+        install_id: str,
+        device_name: str = "",
+        browser_name: str = "",
+        browser_version: str = "",
+        extension_version: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        code_hash = self._token_hash(code)
+        device_token = f"wdev_{secrets.token_urlsafe(32)}"
+        device_id = self._new_id("dev")
+        token_hash = self._token_hash(device_token)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE device_pairing_codes
+                SET redeemed_at=now()
+                WHERE code_hash=%s AND redeemed_at IS NULL AND expires_at > now()
+                RETURNING *
+                """,
+                (code_hash,),
+            )
+            pairing = cur.fetchone()
+            if not pairing:
+                return None
+            cur.execute(
+                """
+                INSERT INTO devices(
+                    id, household_id, child_id, device_name, device_type, browser_name, browser_version,
+                    extension_version, install_id, token_hash, status, last_seen_at
+                )
+                VALUES (%s, %s, %s, %s, 'browser_extension', %s, %s, %s, %s, %s, 'active', now())
+                ON CONFLICT (install_id) DO UPDATE SET
+                    household_id=EXCLUDED.household_id,
+                    child_id=EXCLUDED.child_id,
+                    device_name=EXCLUDED.device_name,
+                    browser_name=EXCLUDED.browser_name,
+                    browser_version=EXCLUDED.browser_version,
+                    extension_version=EXCLUDED.extension_version,
+                    token_hash=EXCLUDED.token_hash,
+                    status='active',
+                    last_seen_at=now(),
+                    updated_at=now()
+                RETURNING *
+                """,
+                (
+                    device_id,
+                    pairing["household_id"],
+                    pairing["child_id"],
+                    device_name,
+                    browser_name,
+                    browser_version,
+                    extension_version,
+                    install_id,
+                    token_hash,
+                ),
+            )
+            device = cur.fetchone()
+        return {"device": device, "device_token": device_token}
+
+    def authenticate_device_token(self, token: str) -> Optional[Dict[str, Any]]:
+        token_hash = self._token_hash(token)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE devices
+                SET last_seen_at=now(), updated_at=now()
+                WHERE token_hash=%s AND status='active'
+                RETURNING *
+                """,
+                (token_hash,),
+            )
+            return cur.fetchone()
+
+    def start_monitoring_session(
+        self,
+        household_id: str,
+        child_id: str,
+        guardian_id: str,
+        device_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE monitoring_sessions
+                SET status='stopped', stopped_by_guardian_id=%s, stopped_at=now(), stop_reason='replaced'
+                WHERE household_id=%s AND child_id=%s AND status='active'
+                """,
+                (guardian_id, household_id, child_id),
+            )
+            cur.execute(
+                """
+                INSERT INTO monitoring_sessions(id, household_id, child_id, device_id, started_by_guardian_id, status)
+                VALUES (%s, %s, %s, %s, %s, 'active')
+                RETURNING *
+                """,
+                (self._new_id("sess"), household_id, child_id, device_id, guardian_id),
+            )
+            return cur.fetchone()
+
+    def stop_monitoring_session(
+        self,
+        household_id: str,
+        child_id: Optional[str],
+        guardian_id: str,
+        reason: str = "guardian_stopped",
+    ) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            if child_id:
+                cur.execute(
+                    """
+                    UPDATE monitoring_sessions
+                    SET status='stopped', stopped_by_guardian_id=%s, stopped_at=now(), stop_reason=%s
+                    WHERE household_id=%s AND child_id=%s AND status='active'
+                    """,
+                    (guardian_id, reason, household_id, child_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE monitoring_sessions
+                    SET status='stopped', stopped_by_guardian_id=%s, stopped_at=now(), stop_reason=%s
+                    WHERE household_id=%s AND status='active'
+                    """,
+                    (guardian_id, reason, household_id),
+                )
+            return cur.rowcount
+
+    def get_active_monitoring_session(
+        self,
+        household_id: str,
+        child_id: str,
+        device_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            params: List[Any] = [household_id, child_id]
+            device_scope = ""
+            if device_id:
+                params.append(device_id)
+                device_scope = " AND (device_id=%s OR device_id IS NULL)"
+            cur.execute(
+                f"""
+                SELECT *
+                FROM monitoring_sessions
+                WHERE household_id=%s AND child_id=%s AND status='active'
+                {device_scope}
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                params,
+            )
+            return cur.fetchone()
+
+    def insert_screenshot_file(
+        self,
+        *,
+        household_id: str,
+        child_id: Optional[str],
+        device_id: Optional[str],
+        event_id: str,
+        session_id: Optional[str],
+        local_path: str,
+        sha256: Optional[str],
+        size_bytes: Optional[int],
+        ocr_text: Optional[str] = None,
+    ) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO screenshot_files(
+                    id, household_id, child_id, device_id, event_id, session_id, local_path, sha256, size_bytes, ocr_text, captured_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                """,
+                (self._new_id("shot"), household_id, child_id, device_id, event_id, session_id, local_path, sha256, size_bytes, ocr_text),
+            )
 
     @staticmethod
     def _safe_json(value: Any) -> Any:

@@ -53,8 +53,9 @@ class GuardianLearningLoop:
             "patterns": merged_patterns,
             "sample_count": len(overrides),
         }
-        db.set_setting("guardian_feedback", json.dumps(payload))
-        db.mark_override_processed([ov["id"] for ov in overrides])
+        household_id = overrides[0].get("household_id") or "hh_legacy"
+        db.set_setting("guardian_feedback", json.dumps(payload), household_id)
+        db.mark_override_processed([ov["override_id"] for ov in overrides if ov.get("override_id")])
         self.logger.info("guardian_feedback_updated", override_count=len(overrides), pattern_count=len(merged_patterns))
         # Mirror the guardian guidance update into the session log for traceability.
         activity_logger.log_service_event(

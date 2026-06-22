@@ -4,7 +4,6 @@ from urllib.parse import urlparse
 from datetime import datetime, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from watchit_core.config import settings
-from watchit_core.db import db
 
 def _parse_time_range(spec: str) -> tuple[time, time]:
     # "21:00-07:00"
@@ -35,9 +34,6 @@ def _schedule_now(child_profile: Dict[str, Any] | None = None) -> datetime:
     except ZoneInfoNotFoundError:
         return datetime.now().astimezone()
 
-def _paused_until() -> int | None:
-    return db.get_paused_until()
-
 STRICTNESS_THRESHOLDS = {
     "lenient": {"block": 0.95},
     "standard": {"block": 0.9},
@@ -59,12 +55,6 @@ class PolicyEngine:
         child_profile: Dict[str, Any] | None = None,
         headline_result: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
-        # Global pause check
-        now_ms = int(datetime.now().timestamp()*1000)
-        paused = _paused_until()
-        if paused and now_ms < paused:
-            return {"action":"allow", "reason":"paused", "categories":[]}
-
         # Schedule in the child's configured timezone.
         now = _schedule_now(child_profile)
         if _in_quiet_hours(now, settings.sched_days, settings.sched_quiet):

@@ -6,11 +6,12 @@ def sse_pack(event: Dict[str, Any]) -> bytes:
     payload = orjson.dumps(event)
     return b"data: " + payload + b"\n\n"
 
-async def sse_generator(queue) -> AsyncGenerator[bytes, None]:
+async def sse_generator(queue, household_id: str | None = None) -> AsyncGenerator[bytes, None]:
     try:
         while True:
             item = await queue.get()
-            yield sse_pack(item)
+            if household_id is None or item.get("household_id") == household_id:
+                yield sse_pack(item)
             queue.task_done()
     except Exception:
         return

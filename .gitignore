@@ -45,6 +45,7 @@ apps/dashboard/.turbo/
 apps/dashboard/out/
 apps/dashboard/dist/
 apps/dashboard/.vercel/
+apps/dashboard/next-env.d.ts
 
 # Environment files
 apps/dashboard/.env

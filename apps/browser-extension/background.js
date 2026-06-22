@@ -1,9 +1,49 @@
 const API = "http://127.0.0.1:4849";
-const childId = "child_main";
 
 let es = null;
 const eventContextByTab = new Map();
 const upgradedEvents = new Set();
+
+async function getOrCreateInstallId(){
+  const stored = await chrome.storage.local.get(["installId"]);
+  if(stored.installId) return stored.installId;
+  const installId = crypto.randomUUID();
+  await chrome.storage.local.set({ installId });
+  return installId;
+}
+
+async function authHeaders(){
+  const stored = await chrome.storage.local.get(["deviceToken"]);
+  if(!stored.deviceToken) return null;
+  return { "content-type": "application/json", "authorization": `Bearer ${stored.deviceToken}` };
+}
+
+async function redeemPairingCode(code){
+  const installId = await getOrCreateInstallId();
+  const resp = await fetch(`${API}/v1/device/redeem`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      code,
+      install_id: installId,
+      device_name: navigator.userAgent,
+      browser_name: "chromium",
+      extension_version: chrome.runtime.getManifest().version
+    })
+  });
+  if(!resp.ok) throw new Error("pairing failed");
+  const data = await resp.json();
+  await chrome.storage.local.set({ deviceToken: data.device_token, device: data.device });
+  return data.device;
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse)=>{
+  if(!msg || msg.type !== "watchit_pair") return;
+  redeemPairingCode(msg.code)
+    .then((device)=>sendResponse({ ok: true, device }))
+    .catch((err)=>sendResponse({ ok: false, error: String(err) }));
+  return true;
+});
 
 async function submitUpgrade(tab, msg){
   if(!msg || !msg.needs_ocr || !msg.event_id || upgradedEvents.has(msg.event_id)) return;
@@ -14,13 +54,15 @@ async function submitUpgrade(tab, msg){
   if(!b64) return;
   upgradedEvents.add(msg.event_id);
   const upgradeEvt = {
-    id: msg.event_id, child_id: childId, ts: Date.now(), kind: "content",
+    id: msg.event_id, child_id: "paired", ts: Date.now(), kind: "content",
     url: ctx.url, title: ctx.title || "", tab_id: tabKey, referrer: "",
     data_json: JSON.stringify({ dom_sample: ctx.domSample || "", screenshots_b64: [b64] })
   };
+  const headers = await authHeaders();
+  if(!headers) return;
   await fetch(`${API}/v1/event/upgrade`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: JSON.stringify(upgradeEvt)
   });
 }
@@ -82,7 +124,7 @@ chrome.webNavigation.onCommitted.addListener(async (details)=>{
 
   // FAST pass
   const baseEvt = {
-    child_id: childId, ts: Date.now(), kind: "visit",
+    child_id: "paired", ts: Date.now(), kind: "visit",
     url: details.url, title: tab.title || "", tab_id: `c-${details.tabId}`, referrer: "",
     data_json: JSON.stringify({ dom_sample: domSample })
   };
@@ -93,6 +135,8 @@ chrome.webNavigation.onCommitted.addListener(async (details)=>{
   });
 
   try{
-    await fetch(`${API}/v1/event`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(baseEvt) });
+    const headers = await authHeaders();
+    if(!headers) return;
+    await fetch(`${API}/v1/event`, { method: "POST", headers, body: JSON.stringify(baseEvt) });
   }catch(_){}
 });
