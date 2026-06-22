@@ -23,7 +23,7 @@ Current MVP scope:
 - Clerk authentication for dashboard guardians.
 - Household-scoped data model with guardians, children, devices, monitoring sessions, events, decisions, overrides, schedules, screenshot metadata, and audit logs.
 - Postgres/Neon as the source of truth, managed through Alembic migrations.
-- Agent worker pipeline with URL safety, headline checks, OCR/ASR hooks, LLM judging, policy decisions, URL decision cache, and queue timing instrumentation.
+- Agent worker pipeline with URL safety, headline checks, Docling OCR/ASR hooks, LLM judging, policy decisions, URL decision cache, and queue timing instrumentation.
 - Local screenshot files only under `screenshots/YYYY-MM-DD/{event_id}/`; database stores metadata only.
 
 Major assumptions and constraints:
@@ -69,7 +69,7 @@ AI/agentic components:
 - `services/agent-worker` runs the LangGraph safety pipeline.
 - `watchit_agents/runtime.py` coordinates event processing, pause checks, screenshot persistence, URL cache lookup/write, graph invocation, decision write, SSE publish, and pipeline timing logs.
 - `watchit_agents/llm_provider.py` selects Anthropic, OpenAI-compatible cloud, or Ollama providers from env vars.
-- `watchit_agents/llm_judge.py`, `safety.py`, `graph.py`, and `agents/*` implement classification, planning, OCR, headline, URL, and policy steps.
+- `watchit_agents/llm_judge.py`, `safety.py`, `graph.py`, and `agents/*` implement classification, planning, Docling OCR, headline, URL, and policy steps.
 - RAG is not present yet. Do not add vector/RAG tables or dependencies unless explicitly requested.
 
 Browser extension and workers:
@@ -109,7 +109,7 @@ Guardian dashboard features:
 
 AI/automation features:
 - Asynchronous event queue and worker pipeline.
-- Fast safety checks, headline agent, URL/LLM judge, OCR path, policy engine, URL decision cache, and guardian learning from overrides.
+- Fast safety checks, headline agent, URL/LLM judge, Docling OCR path, policy engine, URL decision cache, and guardian learning from overrides.
 - Structured timing logs for queue wait, pipeline steps, cache behavior, and decision publishing.
 
 Data collection, storage, and reporting:
@@ -174,7 +174,7 @@ Root:
 - Naming: `YYYYMMDD_NNNN_short_description.py`.
 - Imports: migrations should be deterministic and avoid app runtime imports except Alembic/SQLAlchemy.
 
-`logs`, `screenshots`, `.paddleocr_cache`, `.venv`, `node_modules`, `.next`:
+`logs`, `screenshots`, `.docling_cache`, `.venv`, `node_modules`, `.next`:
 - Local/generated only. Do not commit.
 
 ## 5. Coding Practices

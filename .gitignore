@@ -19,7 +19,7 @@ node_modules/
 logs/
 *.log
 screenshots/
-.paddleocr_cache/
+.docling_cache/
 env_file
 
 # Local databases or cache files

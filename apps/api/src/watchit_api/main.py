@@ -24,7 +24,7 @@ from watchit_core.activity_logger import log_service_event, log_service_shutdown
 configure_logging("api")
 logger = get_logger("watchit.api")
 
-app = FastAPI(title="WatchIt Local API", version="0.2.0", description="Local-only parental monitoring with PaddleOCR and predictive blocking")
+app = FastAPI(title="WatchIt Local API", version="0.2.0", description="Local-only parental monitoring with Docling OCR and predictive blocking")
 _learning_loop: GuardianLearningLoop | None = None
 _learning_task: asyncio.Task | None = None
 _agent_worker: AgentWorker | None = None

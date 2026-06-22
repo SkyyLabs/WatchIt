@@ -35,7 +35,7 @@ Local development can run the worker embedded in the API. Production should run 
 - Neon Postgres connection string in `DATABASE_URL`
 - Clerk app for guardian authentication
 - Anthropic API key for Claude, or Ollama running locally for local mode
-- Optional PaddleOCR runtime for screenshot OCR
+- Optional Docling runtime for screenshot OCR/document conversion
 
 ## Environment
 
@@ -156,7 +156,7 @@ Guardian/admin endpoints require Clerk bearer tokens. Extension ingest endpoints
 - Auth: Clerk.
 - LLM: Claude primary with local Ollama/Llama fallback where available.
 
-The worker host is simply the platform that runs background processing outside HTTP requests. Render is the current choice because the agent worker can run as a long-lived process with OCR/model dependencies while sharing the same Neon `DATABASE_URL` as the API.
+The worker host is simply the platform that runs background processing outside HTTP requests. Render is the current choice because the agent worker can run as a long-lived process with Docling OCR/model dependencies while sharing the same Neon `DATABASE_URL` as the API.
 
 ## Logging
 
