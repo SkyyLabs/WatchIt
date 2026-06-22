@@ -44,7 +44,7 @@ run-dashboard:
 
 
 db-init:
-	$(VENV)/bin/alembic upgrade head
+	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/alembic upgrade head
 
 
 clean:

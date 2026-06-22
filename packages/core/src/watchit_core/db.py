@@ -10,6 +10,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from watchit_core.config import settings
+from watchit_core.migrations import run_migrations
 
 
 class Database:
@@ -19,7 +20,7 @@ class Database:
         self.dsn = dsn
 
     def connect(self) -> None:
-        self.init_schema()
+        run_migrations(self.dsn)
 
     def _connect(self):
         dsn = self.dsn or settings.database_url
@@ -28,6 +29,7 @@ class Database:
         return psycopg.connect(dsn, row_factory=dict_row)
 
     def init_schema(self) -> None:
+        """Legacy fallback for direct schema bootstrap. Prefer Alembic migrations."""
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
             cur.execute(

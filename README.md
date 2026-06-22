@@ -176,5 +176,7 @@ The worker host is simply the platform that runs background processing outside H
 - `make run` aliases `make run-api`.
 - `make run-agent-worker` starts the standalone background processor.
 - `make run-dashboard` starts the Next.js dashboard.
-- `packages/core/src/watchit_core/db.py` initializes the current Postgres schema and enables `pgvector`.
-- Before production, replace schema auto-creation with migrations and add a dedicated extension device credential.
+- `make db-init` applies Alembic migrations to the configured `DATABASE_URL`.
+- The API and workers run migrations on startup before reading or writing application tables.
+- `packages/core/src/watchit_core/db.py` owns repository access; schema changes should be added under `migrations/versions`.
+- Before production, add a dedicated extension device credential.

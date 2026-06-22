@@ -1,8 +1,8 @@
 from __future__ import annotations
-from typing import Dict, Any, List
+from typing import Dict, Any
 from urllib.parse import urlparse
 from datetime import datetime, time
-import zoneinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from watchit_core.config import settings
 from watchit_core.db import db
 
@@ -25,6 +25,15 @@ def _in_quiet_hours(now: datetime, days_csv: str, quiet_spec: str) -> bool:
     else:
         # wraps midnight
         return not (end < t < start)
+
+def _schedule_now(child_profile: Dict[str, Any] | None = None) -> datetime:
+    timezone_name = (child_profile or {}).get("timezone")
+    if not timezone_name:
+        return datetime.now().astimezone()
+    try:
+        return datetime.now(ZoneInfo(str(timezone_name)))
+    except ZoneInfoNotFoundError:
+        return datetime.now().astimezone()
 
 def _paused_until() -> int | None:
     return db.get_paused_until()
@@ -56,8 +65,8 @@ class PolicyEngine:
         if paused and now_ms < paused:
             return {"action":"allow", "reason":"paused", "categories":[]}
 
-        # Schedule (local device timezone)
-        now = datetime.now()
+        # Schedule in the child's configured timezone.
+        now = _schedule_now(child_profile)
         if _in_quiet_hours(now, settings.sched_days, settings.sched_quiet):
             # During quiet hours, allow only educational domains; block others
             url = event.get("url") or ""
