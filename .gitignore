@@ -46,6 +46,7 @@ apps/dashboard/out/
 apps/dashboard/dist/
 apps/dashboard/.vercel/
 apps/dashboard/next-env.d.ts
+apps/dashboard/tsconfig.tsbuildinfo
 
 # Environment files
 apps/dashboard/.env

@@ -1,5 +1,7 @@
 import { ClerkProvider } from "@clerk/nextjs";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { serverLogger } from "../lib/server-logger";
+import "./globals.css";
 
 export const metadata = {
   title: "WatchIt",
@@ -15,8 +17,10 @@ export default function RootLayout({
 
   return (
     <ClerkProvider>
-      <html lang="en">
-        <body>{children}</body>
+      <html lang="en" className="dark font-sans">
+        <body className="antialiased">
+          <TooltipProvider>{children}</TooltipProvider>
+        </body>
       </html>
     </ClerkProvider>
   )

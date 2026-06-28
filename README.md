@@ -58,7 +58,6 @@ WATCHIT_OLLAMA_BASE_URL=http://localhost:11434
 WATCHIT_PROCESSING_MODE=async
 WATCHIT_EMBEDDED_AGENT_WORKER=true
 WATCHIT_ENABLE_OCR=true
-WATCHIT_PARENT_PIN=123456
 ```
 
 Dashboard `apps/dashboard/.env.local`:
@@ -127,7 +126,6 @@ Load the browser extension from `apps/browser-extension` through `chrome://exten
 | `WATCHIT_OLLAMA_BASE_URL` | Ollama endpoint | `http://localhost:11434` |
 | `WATCHIT_ENABLE_OCR` | Enable screenshot OCR | `true` |
 | `WATCHIT_SAVE_SCREENSHOTS` | Persist screenshots to disk | `false` |
-| `WATCHIT_PARENT_PIN` | PIN for pause/resume controls | `123456` |
 | `WATCHIT_LOG_LEVEL` | Python API/worker structured log level and dashboard server log level | `info` |
 | `LOG_LEVEL` | Fallback server log level | `info` |
 | `WATCHIT_AGENT_TRACE_FILES` | Write detailed local agent trace files under `logs/sessions` | `false` |
@@ -142,8 +140,10 @@ Load the browser extension from `apps/browser-extension` through `chrome://exten
 - `GET /v1/children`: list child profiles.
 - `POST /v1/children/{child_id}/settings`: update child strictness and age.
 - `POST /v1/decisions/{decision_id}/override`: store guardian correction.
-- `POST /v1/control/pause`: pause enforcement with parent PIN.
-- `POST /v1/control/resume`: resume enforcement with parent PIN.
+- `GET /v1/settings/security`: fetch household security setup status.
+- `POST /v1/settings/parent-pin`: initialize or change the household parent PIN.
+- `POST /v1/control/pause`: pause enforcement with the DB-managed parent PIN.
+- `POST /v1/control/resume`: resume enforcement after Clerk-authenticated guardian action.
 
 Guardian/admin endpoints require Clerk bearer tokens. Extension ingest endpoints still need a production device-token model before public deployment.
 
@@ -179,4 +179,5 @@ The worker host is simply the platform that runs background processing outside H
 - `make db-init` applies Alembic migrations to the configured `DATABASE_URL`.
 - The API and workers run migrations on startup before reading or writing application tables.
 - `packages/core/src/watchit_core/db.py` owns repository access; schema changes should be added under `migrations/versions`.
+- The parent PIN is initialized and changed from the dashboard onboarding/settings UI. Do not configure it in `.env`.
 - Before production, add a dedicated extension device credential.

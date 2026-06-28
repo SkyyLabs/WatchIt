@@ -107,8 +107,16 @@ async def _shutdown():
             pass
         _learning_task = None
 
-class PinPayload(BaseModel):
-    pin: str
+PIN_POLICY = {"min_length": 4, "max_length": 8, "digits_only": True}
+
+
+def _valid_parent_pin(pin: str | None) -> bool:
+    return bool(pin and pin.isdigit() and PIN_POLICY["min_length"] <= len(pin) <= PIN_POLICY["max_length"])
+
+
+class ParentPinPayload(BaseModel):
+    current_pin: Optional[str] = None
+    new_pin: str
 
 class PausePayload(BaseModel):
     pin: str
@@ -123,6 +131,7 @@ class UpgradeInput(EventInput):
 class ChildSettingsPayload(BaseModel):
     strictness: Optional[Literal["lenient","standard","strict"]] = None
     age: Optional[int] = None
+    name: Optional[str] = None
 
 class DecisionOverridePayload(BaseModel):
     action: Literal["allow","warn","blur","block","notify"]
@@ -214,11 +223,41 @@ async def stream_decisions(guardian_ctx=Depends(require_guardian_stream)):
         background=BackgroundTask(bus.unsubscribe, q),
     )
 
+@app.get("/v1/settings/security")
+async def get_security_settings(guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    return {"parent_pin_set": db.is_parent_pin_set(household_id), "pin_policy": PIN_POLICY}
+
+@app.post("/v1/settings/parent-pin")
+async def set_parent_pin(payload: ParentPinPayload, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if not _valid_parent_pin(payload.new_pin):
+        raise HTTPException(400, "pin must be 4-8 digits")
+    pin_exists = db.is_parent_pin_set(household_id)
+    if pin_exists:
+        if not payload.current_pin:
+            raise HTTPException(400, "current_pin_required")
+        if not db.verify_parent_pin(payload.current_pin, household_id):
+            raise HTTPException(403, "Invalid PIN")
+    db.set_parent_pin(payload.new_pin, household_id, guardian_id)
+    db.log_audit(
+        household_id,
+        "parent_pin_changed" if pin_exists else "parent_pin_set",
+        guardian_id=guardian_id,
+        entity_type="household_setting",
+        entity_id="parent_pin",
+    )
+    logger.info("parent_pin_updated", pin_previously_set=pin_exists)
+    return {"ok": True, "parent_pin_set": True}
+
 @app.post("/v1/control/pause")
 async def control_pause(body: PausePayload, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     guardian_id = guardian_ctx["guardian"]["id"]
-    if body.pin != settings.parent_pin:
+    if not db.is_parent_pin_set(household_id):
+        raise HTTPException(409, "parent_pin_required")
+    if not db.verify_parent_pin(body.pin, household_id):
         raise HTTPException(403, "Invalid PIN")
     import time
     # If minutes not provided or <=0, treat as an indefinite pause (10-year horizon).
@@ -259,10 +298,11 @@ async def update_child(child_id: str, payload: ChildSettingsPayload, guardian_ct
     guardian_id = guardian_ctx["guardian"]["id"]
     if payload.age is not None and (payload.age < 3 or payload.age > 18):
         raise HTTPException(400, "age must be between 3 and 18")
-    if payload.strictness is None and payload.age is None:
-        raise HTTPException(400, "provide strictness and/or age")
-    db.add_child_profile(child_id, household_id=household_id)
-    db.update_child_profile(child_id, strictness=payload.strictness, age=payload.age, household_id=household_id, name=child_id)
+    if payload.strictness is None and payload.age is None and payload.name is None:
+        raise HTTPException(400, "provide strictness, age, and/or name")
+    display_name = payload.name.strip() if payload.name else None
+    db.add_child_profile(child_id, household_id=household_id, name=display_name or child_id)
+    db.update_child_profile(child_id, strictness=payload.strictness, age=payload.age, household_id=household_id, name=display_name)
     profile = db.get_child_profile(child_id, household_id) or {}
     db.set_active_child_id(child_id, household_id, guardian_id)
     db.log_audit(household_id, "child_settings_updated", guardian_id=guardian_id, entity_type="child", entity_id=child_id, metadata=payload.model_dump())

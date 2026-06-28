@@ -104,7 +104,7 @@ Guardian dashboard features:
 - Child profile creation and settings for age and strictness.
 - Pairing code generation for the selected child.
 - Start/stop monitoring sessions for the selected child.
-- Pause/resume monitoring with parent PIN.
+- Pause/resume monitoring with a DB-managed household parent PIN.
 - Client log export.
 
 AI/automation features:
@@ -209,12 +209,13 @@ State management:
 - Extension stores device token and install metadata in `chrome.storage.local`.
 
 Error handling and validation:
-- Validate age, actions, pairing codes, monitoring state, and required ids at API boundaries.
+- Validate age, actions, pairing codes, monitoring state, parent PIN policy, and required ids at API boundaries.
 - Treat missing or invalid auth as 401, forbidden scope as 403, missing resources as 404, inactive monitoring as 409.
 - Avoid broad `except` blocks unless logging and safe fallback are intentional.
 
 Logging:
 - Python services use `structlog` through `watchit_core.logging`.
+- Dashboard UI uses Tailwind CSS and shadcn/ui primitives under `apps/dashboard/src/components/ui`.
 - Dashboard server logs use Pino.
 - Dashboard client logs use `client-logger`.
 - Include request id, household id, child id, device id, event id, job id, and timings where available.
@@ -222,6 +223,7 @@ Logging:
 
 Security and privacy:
 - Store device token hashes only.
+- Store parent PIN hashes only; never plaintext PINs.
 - Keep screenshot bytes local under `screenshots/`; database stores metadata only.
 - Preserve household isolation for data reads, writes, SSE, cache, overrides, settings, and logs.
 - Pairing codes should be short-lived and one-time use.

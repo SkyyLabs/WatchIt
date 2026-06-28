@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import secrets
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -19,6 +21,10 @@ from watchit_core.url_cache import normalize_url
 
 class Database:
     """Postgres-backed repository used by API and workers."""
+
+    PARENT_PIN_KEY = "parent_pin"
+    PARENT_PIN_ALGORITHM = "pbkdf2_sha256"
+    PARENT_PIN_ITERATIONS = 260_000
 
     def __init__(self, dsn: Optional[str] = None):
         self.dsn = dsn
@@ -615,12 +621,85 @@ class Database:
                 INSERT INTO household_settings(id, household_id, key, value_json, updated_by_guardian_id, updated_at)
                 VALUES (%s, %s, %s, %s, %s, now())
                 ON CONFLICT (household_id, key) DO UPDATE SET
-                    value_json=EXCLUDED.value_json,
+            value_json=EXCLUDED.value_json,
                     updated_by_guardian_id=EXCLUDED.updated_by_guardian_id,
                     updated_at=now()
                 """,
                 (self._new_id("hset"), household_id, key, Json({"value": value}), guardian_id),
             )
+
+    def get_household_setting_json(self, key: str, household_id: str = "hh_legacy") -> Optional[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT value_json FROM household_settings WHERE household_id=%s AND key=%s", (household_id, key))
+            row = cur.fetchone()
+            if not row:
+                return None
+            value = row["value_json"]
+            return value if isinstance(value, dict) else None
+
+    def set_household_setting_json(
+        self,
+        key: str,
+        value: Dict[str, Any],
+        household_id: str = "hh_legacy",
+        guardian_id: Optional[str] = None,
+    ) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO household_settings(id, household_id, key, value_json, updated_by_guardian_id, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (household_id, key) DO UPDATE SET
+                    value_json=EXCLUDED.value_json,
+                    updated_by_guardian_id=EXCLUDED.updated_by_guardian_id,
+                    updated_at=now()
+                """,
+                (self._new_id("hset"), household_id, key, Json(value), guardian_id),
+            )
+
+    def is_parent_pin_set(self, household_id: str = "hh_legacy") -> bool:
+        pin = self.get_household_setting_json(self.PARENT_PIN_KEY, household_id)
+        return bool(
+            pin
+            and pin.get("algorithm") == self.PARENT_PIN_ALGORITHM
+            and pin.get("salt")
+            and pin.get("hash")
+        )
+
+    def set_parent_pin(self, pin: str, household_id: str = "hh_legacy", guardian_id: Optional[str] = None) -> None:
+        salt = secrets.token_urlsafe(24)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            pin.encode("utf-8"),
+            salt.encode("utf-8"),
+            self.PARENT_PIN_ITERATIONS,
+        ).hex()
+        payload = {
+            "algorithm": self.PARENT_PIN_ALGORITHM,
+            "iterations": self.PARENT_PIN_ITERATIONS,
+            "salt": salt,
+            "hash": digest,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.set_household_setting_json(self.PARENT_PIN_KEY, payload, household_id, guardian_id)
+
+    def verify_parent_pin(self, pin: str, household_id: str = "hh_legacy") -> bool:
+        stored = self.get_household_setting_json(self.PARENT_PIN_KEY, household_id)
+        if not stored or stored.get("algorithm") != self.PARENT_PIN_ALGORITHM:
+            return False
+        try:
+            iterations = int(stored.get("iterations") or self.PARENT_PIN_ITERATIONS)
+            salt = str(stored["salt"])
+            expected = str(stored["hash"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        actual = hashlib.pbkdf2_hmac(
+            "sha256",
+            pin.encode("utf-8"),
+            salt.encode("utf-8"),
+            iterations,
+        ).hex()
+        return hmac.compare_digest(actual, expected)
 
     def delete_setting(self, key: str, household_id: str = "hh_legacy") -> None:
         with self._connect() as conn, conn.cursor() as cur:

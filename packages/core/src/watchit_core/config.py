@@ -13,9 +13,6 @@ class Settings(BaseSettings):
     sched_days: str = Field(default="Mon,Tue,Wed,Thu", alias="WATCHIT_SCHEDULE_DAYS")
     sched_quiet: str = Field(default="21:00-07:00", alias="WATCHIT_SCHEDULE_QUIET")
 
-    # Parent PIN
-    parent_pin: str = Field(default="123456", alias="WATCHIT_PARENT_PIN")
-
     # Ollama
     llm_provider: str = Field(default="ollama", alias="WATCHIT_LLM_PROVIDER")
     ollama_model: str = Field(default="qwen2.5:7b-instruct-q4_K_M", alias="WATCHIT_OLLAMA_MODEL")
