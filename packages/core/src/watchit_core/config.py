@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     cloud_llm_base_url: str | None = Field(default=None, alias="WATCHIT_CLOUD_LLM_BASE_URL")
     cloud_llm_api_key: str | None = Field(default=None, alias="WATCHIT_CLOUD_LLM_API_KEY")
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
-    anthropic_model: str = Field(default="claude-3-5-sonnet-latest", alias="WATCHIT_ANTHROPIC_MODEL")
+    anthropic_model: str = Field(default="claude-sonnet-5", alias="WATCHIT_ANTHROPIC_MODEL")
 
     # Clerk
     clerk_secret_key: str | None = Field(default=None, alias="CLERK_SECRET_KEY")

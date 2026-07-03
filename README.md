@@ -50,7 +50,7 @@ CLERK_JWKS_URL=https://your-clerk-issuer.clerk.accounts.dev/.well-known/jwks.jso
 
 WATCHIT_LLM_PROVIDER=anthropic
 ANTHROPIC_API_KEY=sk-ant-...
-WATCHIT_ANTHROPIC_MODEL=claude-3-5-sonnet-latest
+WATCHIT_ANTHROPIC_MODEL=claude-sonnet-5
 
 WATCHIT_OLLAMA_MODEL=llama3.1
 WATCHIT_OLLAMA_BASE_URL=http://localhost:11434
@@ -121,7 +121,7 @@ Load the browser extension from `apps/browser-extension` through `chrome://exten
 | `WATCHIT_URL_DECISION_CACHE_MIN_CONFIDENCE` | Minimum confidence required before caching pipeline decisions | `0.85` |
 | `WATCHIT_LLM_PROVIDER` | `anthropic`, `ollama`, or `openai` | `ollama` |
 | `ANTHROPIC_API_KEY` | Claude API key | unset |
-| `WATCHIT_ANTHROPIC_MODEL` | Claude model | `claude-3-5-sonnet-latest` |
+| `WATCHIT_ANTHROPIC_MODEL` | Claude model | `claude-sonnet-5` |
 | `WATCHIT_OLLAMA_MODEL` | Local fallback model | `qwen2.5:7b-instruct-q4_K_M` |
 | `WATCHIT_OLLAMA_BASE_URL` | Ollama endpoint | `http://localhost:11434` |
 | `WATCHIT_ENABLE_OCR` | Enable screenshot OCR | `true` |
