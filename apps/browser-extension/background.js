@@ -67,9 +67,11 @@ async function submitUpgrade(tab, msg){
   });
 }
 
-function connectSSE(){
+async function connectSSE(){
   if(es) es.close();
-  es = new EventSource(`${API}/v1/stream/decisions`);
+  const stored = await chrome.storage.local.get(["deviceToken"]);
+  if(!stored.deviceToken){ setTimeout(connectSSE, 1500); return; }
+  es = new EventSource(`${API}/v1/device/stream/decisions?token=${encodeURIComponent(stored.deviceToken)}`);
   es.onmessage = (e)=>{
     try{
       const msg = JSON.parse(e.data);

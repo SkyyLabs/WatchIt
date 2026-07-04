@@ -15,7 +15,7 @@ from watchit_core.config import settings
 from watchit_agents.runtime import process_event, bus, publish_decision_row
 from watchit_agents.worker import AgentWorker
 from watchit_learning.guardian_learning import GuardianLearningLoop
-from watchit_api.auth import require_device, require_guardian, require_guardian_stream
+from watchit_api.auth import require_device, require_device_stream, require_guardian, require_guardian_stream
 from watchit_core.logging import bind_log_context, clear_log_context, configure_logging, get_logger
 from watchit_core.url_cache import url_cache_key
 
@@ -217,6 +217,18 @@ async def stream_decisions(guardian_ctx=Depends(require_guardian_stream)):
     household_id = guardian_ctx["household"]["id"]
     q = bus.subscribe()
     logger.info("decision_stream_subscribed")
+    return StreamingResponse(
+        sse_generator(q, household_id=household_id),
+        media_type="text/event-stream",
+        background=BackgroundTask(bus.unsubscribe, q),
+    )
+
+@app.get("/v1/device/stream/decisions")
+async def stream_device_decisions(device_ctx=Depends(require_device_stream)):
+    from watchit_api.sse import sse_generator
+    household_id = device_ctx["device"]["household_id"]
+    q = bus.subscribe()
+    logger.info("device_decision_stream_subscribed")
     return StreamingResponse(
         sse_generator(q, household_id=household_id),
         media_type="text/event-stream",
