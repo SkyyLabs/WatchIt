@@ -304,6 +304,13 @@ async def list_children(guardian_ctx=Depends(require_guardian)):
     logger.info("children_requested", count=len(children))
     return {"children": children, "active_child_id": db.get_active_child_id(household_id)}
 
+@app.get("/v1/children/{child_id}/devices")
+async def list_child_devices(child_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    if not db.get_child_profile(child_id, household_id):
+        raise HTTPException(404, "child not found")
+    return {"devices": db.fetch_devices(household_id, child_id)}
+
 @app.post("/v1/children/{child_id}/settings")
 async def update_child(child_id: str, payload: ChildSettingsPayload, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
