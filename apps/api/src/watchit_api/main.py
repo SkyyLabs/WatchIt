@@ -315,22 +315,15 @@ async def list_child_devices(child_id: str, guardian_ctx=Depends(require_guardia
         raise HTTPException(404, "child not found")
     return {"devices": db.fetch_devices(household_id, child_id)}
 
-@app.post("/v1/children/{child_id}/settings")
-async def update_child(child_id: str, payload: ChildSettingsPayload, guardian_ctx=Depends(require_guardian)):
+@app.patch("/v1/children/{child_id}")
+async def patch_child(child_id: str, body: ChildSettingsPayload, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     guardian_id = guardian_ctx["guardian"]["id"]
-    if payload.age is not None and (payload.age < 3 or payload.age > 18):
-        raise HTTPException(400, "age must be between 3 and 18")
-    if payload.strictness is None and payload.age is None and payload.name is None:
-        raise HTTPException(400, "provide strictness, age, and/or name")
-    display_name = payload.name.strip() if payload.name else None
-    db.add_child_profile(child_id, household_id=household_id, name=display_name or child_id)
-    db.update_child_profile(child_id, strictness=payload.strictness, age=payload.age, household_id=household_id, name=display_name)
-    profile = db.get_child_profile(child_id, household_id) or {}
-    db.set_active_child_id(child_id, household_id, guardian_id)
-    db.log_audit(household_id, "child_settings_updated", guardian_id=guardian_id, entity_type="child", entity_id=child_id, metadata=payload.model_dump())
-    logger.info("child_settings_updated", child_id=child_id, strictness=payload.strictness, age=payload.age)
-    return {"child": profile}
+    if not db.get_child_profile(child_id, household_id):
+        raise HTTPException(404, "child not found")
+    db.update_child_profile(child_id, strictness=body.strictness, age=body.age, household_id=household_id, name=body.name)
+    db.log_audit(household_id, "child_settings_updated", guardian_id=guardian_id, entity_type="child", entity_id=child_id)
+    return {"ok": True}
 
 @app.post("/v1/decisions/{decision_id}/override")
 async def override_decision(decision_id: str, payload: DecisionOverridePayload, guardian_ctx=Depends(require_guardian)):
