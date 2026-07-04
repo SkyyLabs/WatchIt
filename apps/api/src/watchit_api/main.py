@@ -163,6 +163,10 @@ class DevicePatchPayload(BaseModel):
     paused_until_minutes: int
     pin: Optional[str] = None
 
+class ControlPatchPayload(BaseModel):
+    paused_until_minutes: int
+    pin: Optional[str] = None
+
 @app.post("/v1/event")
 async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
     try:
@@ -273,39 +277,26 @@ async def set_parent_pin(payload: ParentPinPayload, guardian_ctx=Depends(require
     logger.info("parent_pin_updated", pin_previously_set=pin_exists)
     return {"ok": True, "parent_pin_set": True}
 
-@app.post("/v1/control/pause")
-async def control_pause(body: PausePayload, guardian_ctx=Depends(require_guardian)):
+@app.patch("/v1/control")
+async def patch_control(body: ControlPatchPayload, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     guardian_id = guardian_ctx["guardian"]["id"]
+    if body.paused_until_minutes == 0:
+        db.delete_setting("paused_until", household_id)
+        log_service_event("monitor_resumed")
+        logger.info("monitor_resumed")
+        return {"ok": True, "paused_until": None}
     if not db.is_parent_pin_set(household_id):
         raise HTTPException(409, "parent_pin_required")
-    if not db.verify_parent_pin(body.pin, household_id):
+    if not db.verify_parent_pin(body.pin or "", household_id):
         raise HTTPException(403, "Invalid PIN")
-    import time
-    # If minutes not provided or <=0, treat as an indefinite pause (10-year horizon).
-    minutes = body.minutes if body.minutes is not None else 0
+    minutes = body.paused_until_minutes
     horizon_minutes = minutes if minutes > 0 else 10 * 365 * 24 * 60
-    until_ms = int(time.time()*1000 + horizon_minutes*60*1000)
+    until_ms = int(time.time() * 1000 + horizon_minutes * 60 * 1000)
     db.set_setting("paused_until", str(until_ms), household_id, guardian_id)
-    logger.info(
-        "monitor_paused",
-        minutes_requested=minutes,
-        effective_minutes=horizon_minutes,
-        paused_until_ms=until_ms,
-    )
-    log_service_event(
-        "monitor_paused",
-        {"minutes_requested": minutes, "effective_minutes": horizon_minutes, "paused_until_ms": until_ms},
-    )
+    log_service_event("monitor_paused", {"minutes_requested": minutes, "paused_until_ms": until_ms})
+    logger.info("monitor_paused", minutes_requested=minutes, paused_until_ms=until_ms)
     return {"ok": True, "paused_until": until_ms}
-
-@app.post("/v1/control/resume")
-async def control_resume(body: ResumePayload, guardian_ctx=Depends(require_guardian)):
-    household_id = guardian_ctx["household"]["id"]
-    db.delete_setting("paused_until", household_id)
-    log_service_event("monitor_resumed")
-    logger.info("monitor_resumed")
-    return {"ok": True}
 
 @app.get("/v1/children")
 async def list_children(guardian_ctx=Depends(require_guardian)):
