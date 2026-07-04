@@ -1,1 +1,2 @@
+# Editable install of this project. Dependencies are declared in pyproject.toml.
 -e .

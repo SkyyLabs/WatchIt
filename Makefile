@@ -1,4 +1,4 @@
-.PHONY: setup venv deps run run-api run-agent-worker run-dashboard start-ollama pull-model db-init clean
+.PHONY: setup venv deps run run-api run-agent-worker run-dashboard start-ollama pull-model db-init test verify clean
 
 
 VENV=.venv
@@ -18,6 +18,8 @@ venv:
 deps:
 	$(PIP) install --upgrade pip wheel setuptools
 	$(PIP) install -r requirements.txt
+	$(PIP) install -e ".[test]"
+	cd apps/dashboard && npm install
 
 
 start-ollama:
@@ -45,6 +47,20 @@ run-dashboard:
 
 db-init:
 	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/alembic upgrade head
+
+
+test:
+	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/pytest -q
+
+
+# Read-only/build verification suite. Never touches the live DB.
+verify:
+	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/python -m compileall apps/api/src services/agent-worker/src services/learning-worker/src packages/core/src migrations
+	$(VENV)/bin/pip check
+	@heads=$$(PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/alembic heads | grep -c '(head)'); \
+		test "$$heads" -eq 1 || { echo "Expected exactly 1 Alembic head, found $$heads:"; PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/alembic heads; exit 1; }
+	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/pytest -q
+	cd apps/dashboard && npm run typecheck
 
 
 clean:
