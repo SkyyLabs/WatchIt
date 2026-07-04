@@ -258,9 +258,9 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
     const childId = makeChildId(form.name);
     if (!childId) throw new Error("Enter a child name.");
     const authToken = await token();
-    await apiFetch(`/v1/children/${encodeURIComponent(childId)}/settings`, authToken, {
+    await apiFetch(`/v1/children`, authToken, {
       method: "POST",
-      body: JSON.stringify({ name: form.name.trim(), strictness: form.strictness, age: form.age }),
+      body: JSON.stringify({ child_id: childId, name: form.name.trim(), strictness: form.strictness, age: form.age }),
     });
     setChildDialogOpen(false);
     await refreshAll();
@@ -270,8 +270,8 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
   const handleUpdateChild = async (form: ChildFormState) => {
     if (!selectedChild) return;
     const authToken = await token();
-    await apiFetch(`/v1/children/${encodeURIComponent(selectedChild)}/settings`, authToken, {
-      method: "POST",
+    await apiFetch(`/v1/children/${encodeURIComponent(selectedChild)}`, authToken, {
+      method: "PATCH",
       body: JSON.stringify({ name: form.name.trim(), strictness: form.strictness, age: form.age }),
     });
     setChildDialogOpen(false);
@@ -316,9 +316,9 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
     try {
       const mins = parseInt(pauseMinutes || "0", 10);
       const authToken = await token();
-      const data = await apiFetch<{ ok: boolean; paused_until: number }>("/v1/control/pause", authToken, {
-        method: "POST",
-        body: JSON.stringify({ pin: pausePin, minutes: Number.isFinite(mins) ? mins : undefined }),
+      const data = await apiFetch<{ ok: boolean; paused_until: number | null }>("/v1/control", authToken, {
+        method: "PATCH",
+        body: JSON.stringify({ paused_until_minutes: Number.isFinite(mins) ? mins : undefined, pin: pausePin }),
       });
       setIsPausedManual(true);
       setPausedUntilMs(data.paused_until);
@@ -338,7 +338,10 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
 
   const resumeMonitoring = async () => {
     const authToken = await token();
-    await apiFetch("/v1/control/resume", authToken, { method: "POST", body: JSON.stringify({}) });
+    await apiFetch("/v1/control", authToken, {
+      method: "PATCH",
+      body: JSON.stringify({ paused_until_minutes: 0 }),
+    });
     setIsPausedManual(false);
     setPausedUntilMs(null);
     localStorage.removeItem("paused_until");
