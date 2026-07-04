@@ -48,6 +48,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ChildrenView } from "@/components/dashboard/children-view";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -110,6 +111,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
   const [isPausedManual, setIsPausedManual] = useState(false);
   const [pausedUntilMs, setPausedUntilMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [authToken, setAuthToken] = useState<string | null>(null);
   const esRef = useRef<EventSource | null>(null);
 
   const token = useCallback(() => getToken(), [getToken]);
@@ -120,6 +122,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
     setLoading(true);
     try {
       const authToken = await token();
+      setAuthToken(authToken);
       const [childrenResp, decisionsResp, eventsResp, securityResp] = await Promise.all([
         apiFetch<{ children: ChildProfile[]; active_child_id: string | null }>("/v1/children", authToken),
         apiFetch<{ decisions: DecisionRecord[] }>("/v1/decisions?limit=200", authToken),
@@ -173,6 +176,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
       setDecisions([]);
       setSelectedChild(null);
       setSecurity(null);
+      setAuthToken(null);
       if (esRef.current) {
         esRef.current.close();
         esRef.current = null;
@@ -369,6 +373,31 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
     setMonitoringSession(null);
   };
 
+  const createPairingCodeForChild = async (childId: string): Promise<string | null> => {
+    const authToken = await token();
+    const data = await apiFetch<{ pairing_code: { code: string } }>("/v1/device/pairing-codes", authToken, {
+      method: "POST",
+      body: JSON.stringify({ child_id: childId, ttl_minutes: 15 }),
+    });
+    return data.pairing_code?.code || null;
+  };
+
+  const startMonitoringForChild = async (childId: string) => {
+    const authToken = await token();
+    await apiFetch("/v1/monitoring/start", authToken, {
+      method: "POST",
+      body: JSON.stringify({ child_id: childId }),
+    });
+  };
+
+  const stopMonitoringForChild = async (childId: string) => {
+    const authToken = await token();
+    await apiFetch("/v1/monitoring/stop", authToken, {
+      method: "POST",
+      body: JSON.stringify({ child_id: childId }),
+    });
+  };
+
   const overrideDecision = async (decisionId: string, action: string) => {
     setDecisionSaving((previous) => ({ ...previous, [decisionId]: true }));
     try {
@@ -443,7 +472,13 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
           ) : initialView === "profile" ? (
             <ProfileView user={user} />
           ) : initialView === "children" ? (
-            <div>Children</div>
+            <ChildrenView
+              children={children}
+              authToken={authToken}
+              onCreatePairingCode={createPairingCodeForChild}
+              onStartMonitoring={startMonitoringForChild}
+              onStopMonitoring={stopMonitoringForChild}
+            />
           ) : (
             <HomeDashboardView
               needsOnboarding={needsOnboarding}
