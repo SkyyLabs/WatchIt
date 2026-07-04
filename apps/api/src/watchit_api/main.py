@@ -153,6 +153,10 @@ class MonitoringPayload(BaseModel):
     child_id: Optional[str] = None
     device_id: Optional[str] = None
 
+class DevicePatchPayload(BaseModel):
+    paused_until_minutes: int
+    pin: Optional[str] = None
+
 @app.post("/v1/event")
 async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
     try:
@@ -411,6 +415,27 @@ async def redeem_pairing_code(payload: PairingRedeemPayload):
     device = result["device"]
     db.log_audit(device["household_id"], "device_paired", device_id=device["id"], entity_type="device", entity_id=device["id"])
     return {"device": device, "device_token": result["device_token"]}
+
+@app.patch("/v1/devices/{device_id}")
+async def patch_device(device_id: str, body: DevicePatchPayload, guardian_ctx=Depends(require_guardian)):
+    import time
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if body.paused_until_minutes <= 0:
+        db.clear_device_pause(household_id, device_id)
+        db.log_audit(household_id, "device_resumed", guardian_id=guardian_id, device_id=device_id, entity_type="device", entity_id=device_id)
+        logger.info("device_resumed", device_id=device_id)
+        return {"ok": True, "paused_until": None}
+    if not db.is_parent_pin_set(household_id):
+        raise HTTPException(409, "parent_pin_required")
+    if not db.verify_parent_pin(body.pin or "", household_id):
+        raise HTTPException(403, "Invalid PIN")
+    until_ms = int(time.time() * 1000 + body.paused_until_minutes * 60 * 1000)
+    if db.set_device_pause(household_id, device_id, until_ms) == 0:
+        raise HTTPException(404, "device not found")
+    db.log_audit(household_id, "device_paused", guardian_id=guardian_id, device_id=device_id, entity_type="device", entity_id=device_id, metadata={"minutes": body.paused_until_minutes})
+    logger.info("device_paused", device_id=device_id, paused_until_ms=until_ms)
+    return {"ok": True, "paused_until": until_ms}
 
 @app.post("/v1/monitoring/start")
 async def start_monitoring(payload: MonitoringPayload, guardian_ctx=Depends(require_guardian)):
