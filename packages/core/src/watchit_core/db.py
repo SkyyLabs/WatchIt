@@ -219,6 +219,42 @@ class Database:
                 cur.execute("SELECT id, household_id, name, timezone, strictness, age, status, created_at, updated_at FROM children ORDER BY created_at ASC")
             return cur.fetchall()
 
+    def fetch_devices(self, household_id: str, child_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, child_id, device_name, browser_name, status,
+                       last_seen_at, paused_until, created_at
+                FROM devices
+                WHERE household_id=%s AND child_id=%s
+                ORDER BY created_at DESC
+                """,
+                (household_id, child_id),
+            )
+            return cur.fetchall()
+
+    def get_device_paused_until(self, device_id: str) -> Optional[int]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT paused_until FROM devices WHERE id=%s", (device_id,))
+            row = cur.fetchone()
+            return row["paused_until"] if row else None
+
+    def set_device_pause(self, household_id: str, device_id: str, paused_until_ms: int) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET paused_until=%s, updated_at=now() WHERE id=%s AND household_id=%s",
+                (paused_until_ms, device_id, household_id),
+            )
+            return cur.rowcount
+
+    def clear_device_pause(self, household_id: str, device_id: str) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET paused_until=NULL, updated_at=now() WHERE id=%s AND household_id=%s",
+                (device_id, household_id),
+            )
+            return cur.rowcount
+
     def add_event(self, event: Dict[str, Any]) -> str:
         event_id = event.get("id") or f"evt_{uuid.uuid4().hex}"
         child_id = event.get("child_id", "child_default")
