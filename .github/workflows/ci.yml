@@ -27,7 +27,11 @@ jobs:
       - name: Dependency check
         run: pip check
       - name: Migration graph (single head)
-        run: alembic heads
+        run: |
+          heads=$(alembic heads | grep -c '(head)')
+          echo "Alembic heads: $heads"
+          alembic heads
+          if [ "$heads" -ne 1 ]; then echo "::error::Expected exactly 1 Alembic head, found $heads"; exit 1; fi
       - name: Tests
         run: pytest -q
 
