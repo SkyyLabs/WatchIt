@@ -1,7 +1,7 @@
 import { domainFromUrl } from "./format";
 
 export type TimeRange = "today" | "7d" | "30d";
-export type DashboardView = "dashboard" | "settings" | "profile";
+export type DashboardView = "dashboard" | "settings" | "profile" | "children";
 export type DecisionAction = "allow" | "warn" | "blur" | "block" | "notify" | string;
 
 export type ChildProfile = {

@@ -20,6 +20,7 @@ import {
   Settings,
   Shield,
   UserRound,
+  Users,
   UsersRound,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -441,6 +442,8 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
             />
           ) : initialView === "profile" ? (
             <ProfileView user={user} />
+          ) : initialView === "children" ? (
+            <div>Children</div>
           ) : (
             <HomeDashboardView
               needsOnboarding={needsOnboarding}
@@ -532,6 +535,7 @@ function AppShell({ activeView, userName, children }: { activeView: DashboardRou
     { view: "dashboard", href: "/", label: "Dashboard", icon: CircleGauge },
     { view: "settings", href: "/settings", label: "Settings", icon: Settings },
     { view: "profile", href: "/profile", label: "Profile", icon: UserRound },
+    { view: "children", href: "/children", label: "Children", icon: Users },
   ] as const;
   return (
     <div className="mx-auto grid min-h-screen w-full max-w-7xl grid-cols-1 gap-0 lg:grid-cols-[240px_1fr]">
