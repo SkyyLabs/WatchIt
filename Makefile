@@ -1,4 +1,4 @@
-.PHONY: setup venv deps run run-api run-agent-worker run-dashboard start-ollama pull-model db-init clean
+.PHONY: setup venv deps run run-api run-agent-worker run-dashboard start-ollama pull-model db-init test verify clean
 
 
 VENV=.venv
@@ -45,6 +45,19 @@ run-dashboard:
 
 db-init:
 	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/alembic upgrade head
+
+
+test:
+	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/pytest -q
+
+
+# Read-only/build verification suite. Never touches the live DB.
+verify:
+	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/python -m compileall apps/api/src services/agent-worker/src services/learning-worker/src packages/core/src migrations
+	$(VENV)/bin/pip check
+	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/alembic heads
+	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/pytest -q
+	cd apps/dashboard && npm run typecheck
 
 
 clean:
