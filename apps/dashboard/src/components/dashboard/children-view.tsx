@@ -20,7 +20,7 @@ type DeviceRow = {
 
 type Props = {
   children: ChildProfile[];
-  authToken: string | null;
+  getToken: () => Promise<string | null>;
   onCreatePairingCode: (childId: string) => Promise<string | null>;
   onStartMonitoring: (childId: string) => Promise<void>;
   onStopMonitoring: (childId: string) => Promise<void>;
@@ -41,7 +41,7 @@ export function ChildrenView(props: Props) {
   );
 }
 
-function ChildCard({ child, authToken, onCreatePairingCode, onStartMonitoring, onStopMonitoring }: { child: ChildProfile } & Props) {
+function ChildCard({ child, getToken, onCreatePairingCode, onStartMonitoring, onStopMonitoring }: { child: ChildProfile } & Props) {
   const [code, setCode] = useState<string | null>(null);
   const [devices, setDevices] = useState<DeviceRow[] | null>(null);
   const [busy, setBusy] = useState(false);
@@ -50,6 +50,7 @@ function ChildCard({ child, authToken, onCreatePairingCode, onStartMonitoring, o
   const loadDevices = async () => {
     setError(null);
     try {
+      const authToken = await getToken();
       const data = await apiFetch<{ devices: DeviceRow[] }>(`/v1/children/${encodeURIComponent(child.id)}/devices`, authToken);
       setDevices(data.devices);
     } catch (e) {
@@ -108,7 +109,7 @@ function ChildCard({ child, authToken, onCreatePairingCode, onStartMonitoring, o
           <div className="space-y-2">
             {devices.length === 0 && <p className="text-sm text-muted-foreground">No paired devices.</p>}
             {devices.map((d) => (
-              <DeviceRowView key={d.id} device={d} authToken={authToken} onChanged={loadDevices} />
+              <DeviceRowView key={d.id} device={d} getToken={getToken} onChanged={loadDevices} />
             ))}
           </div>
         )}
@@ -117,7 +118,7 @@ function ChildCard({ child, authToken, onCreatePairingCode, onStartMonitoring, o
   );
 }
 
-function DeviceRowView({ device, authToken, onChanged }: { device: DeviceRow; authToken: string | null; onChanged: () => Promise<void> }) {
+function DeviceRowView({ device, getToken, onChanged }: { device: DeviceRow; getToken: () => Promise<string | null>; onChanged: () => Promise<void> }) {
   const [minutes, setMinutes] = useState("30");
   const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
@@ -128,6 +129,7 @@ function DeviceRowView({ device, authToken, onChanged }: { device: DeviceRow; au
     setBusy(true);
     setError(null);
     try {
+      const authToken = await getToken();
       await apiFetch(`/v1/devices/${encodeURIComponent(device.id)}`, authToken, {
         method: "PATCH",
         body: JSON.stringify(withPin ? { paused_until_minutes, pin } : { paused_until_minutes }),

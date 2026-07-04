@@ -474,7 +474,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
           ) : initialView === "children" ? (
             <ChildrenView
               children={children}
-              authToken={authToken}
+              getToken={token}
               onCreatePairingCode={createPairingCodeForChild}
               onStartMonitoring={startMonitoringForChild}
               onStopMonitoring={stopMonitoringForChild}
