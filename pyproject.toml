@@ -30,6 +30,12 @@ dependencies = [
   "psycopg[binary]>=3.1",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.setuptools]
 package-dir = {"" = "."}
 
