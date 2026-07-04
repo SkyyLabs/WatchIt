@@ -133,6 +133,12 @@ class ChildSettingsPayload(BaseModel):
     age: Optional[int] = None
     name: Optional[str] = None
 
+class ChildCreatePayload(BaseModel):
+    child_id: str
+    name: str
+    strictness: Optional[Literal["lenient","standard","strict"]] = None
+    age: Optional[int] = None
+
 class DecisionOverridePayload(BaseModel):
     action: Literal["allow","warn","blur","block","notify"]
     reason: Optional[str] = None
@@ -314,6 +320,23 @@ async def list_child_devices(child_id: str, guardian_ctx=Depends(require_guardia
     if not db.get_child_profile(child_id, household_id):
         raise HTTPException(404, "child not found")
     return {"devices": db.fetch_devices(household_id, child_id)}
+
+@app.post("/v1/children")
+async def create_child(payload: ChildCreatePayload, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if payload.age is not None and (payload.age < 3 or payload.age > 18):
+        raise HTTPException(400, "age must be between 3 and 18")
+    display_name = payload.name.strip() if payload.name else ""
+    if not display_name:
+        raise HTTPException(400, "name is required")
+    db.add_child_profile(payload.child_id, household_id=household_id, name=display_name)
+    db.update_child_profile(payload.child_id, strictness=payload.strictness, age=payload.age, household_id=household_id, name=display_name)
+    profile = db.get_child_profile(payload.child_id, household_id) or {}
+    db.set_active_child_id(payload.child_id, household_id, guardian_id)
+    db.log_audit(household_id, "child_created", guardian_id=guardian_id, entity_type="child", entity_id=payload.child_id, metadata=payload.model_dump())
+    logger.info("child_created", child_id=payload.child_id, strictness=payload.strictness, age=payload.age)
+    return {"child": profile}
 
 @app.patch("/v1/children/{child_id}")
 async def patch_child(child_id: str, body: ChildSettingsPayload, guardian_ctx=Depends(require_guardian)):
