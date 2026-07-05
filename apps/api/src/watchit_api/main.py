@@ -12,7 +12,7 @@ from typing import Literal, Optional
 from watchit_api.schemas import EventInput
 from watchit_core.db import db
 from watchit_core.config import settings
-from watchit_agents.runtime import process_event, bus, publish_decision_row
+from watchit_agents.runtime import process_event, bus, publish_decision_row, _decision_message_from_row
 from watchit_agents.worker import AgentWorker
 from watchit_learning.guardian_learning import GuardianLearningLoop
 from watchit_api.auth import require_device, require_device_stream, require_guardian, require_guardian_stream
@@ -213,6 +213,16 @@ async def post_event_upgrade(evt: UpgradeInput, device_ctx=Depends(require_devic
     except Exception:
         logger.exception("event_upgrade_enqueue_failed")
         raise HTTPException(500, "internal error")
+
+@app.get("/v1/event/{event_id}/decision")
+def get_event_decision(event_id: str, device_ctx=Depends(require_device)):
+    # The extension polls this after posting a visit so enforcement no longer
+    # depends on the in-memory SSE push reaching a (possibly evicted) MV3 worker.
+    household_id = device_ctx["device"]["household_id"]
+    row = db.get_decision_by_event(event_id, household_id)
+    if not row:
+        return {"status": "pending"}
+    return {"status": "decided", "decision": _decision_message_from_row(row)}
 
 @app.get("/v1/events")
 def get_events(child_id: str | None = None, limit: int = 50, guardian_ctx=Depends(require_guardian)):

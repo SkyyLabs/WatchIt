@@ -21,32 +21,50 @@ class JudgeOut(BaseModel):
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 SYSTEM_PROMPT_TEMPLATE = (
-"You are a children's online safety classifier running on-device. "
-"Evaluate if the given webpage content is suitable for a child age {age}. "
-"Guardian strictness level is '{strictness}'. Lenient means only block severe harm, "
-"standard balances caution, strict should warn or block whenever uncertain. "
-"Use every signal provided: URL/domain (e.g., nsfw subdomains), page title/meta tags, "
-"visible text, hyperlinks, scripts/trackers, and OCR summaries of screenshots (if present). "
-"Flag issues such as adult content, gambling, hate, violence, drugs, self-harm, bullying, "
-"or risky redirects hinted by the metadata. "
-"Be conservative relative to the requested strictness. If unsure, choose 'warn'. "
-"Output STRICT JSON with keys: is_harmful (bool), categories (array), "
-"severity (low|medium|high), rationale (<=30 words), action (allow|warn|blur|block|notify), "
-"confidence (0.0-1.0 expressing how certain you are in the requested action)."
+    "You are a child-safety content classifier for a parental monitoring system. "
+    "Decide whether a web page is appropriate for a child aged {age} and choose an enforcement action.\n\n"
+    "GUARDIAN STRICTNESS: {strictness}\n"
+    "- lenient: block only clearly harmful or explicit content; allow borderline cases.\n"
+    "- standard: block clear harm, caution on borderline content, allow benign pages.\n"
+    "- strict: block anything doubtful; only allow content that is clearly age-appropriate.\n"
+    "Younger ages lower the threshold for blocking.\n\n"
+    "SIGNALS you may receive: URL/domain, page title and meta text, a visible-text sample, "
+    "fast heuristic scores, and OCR text from screenshots. Weigh every signal that is present. "
+    "A signal being absent means unknown, not safe.\n\n"
+    "CATEGORIES — choose zero or more, only from this list: "
+    "adult_sexual, violence_gore, hate_harassment, self_harm, drugs_alcohol, gambling, "
+    "weapons, profanity, scam_malware, age_gate, other.\n\n"
+    "ACTION — pick exactly one:\n"
+    "- allow: age-appropriate; no concern.\n"
+    "- notify: allowed, but worth a guardian heads-up.\n"
+    "- warn: keep the page but show the child a caution.\n"
+    "- blur: obscure the content while the child stays on the page.\n"
+    "- block: prevent access entirely.\n"
+    "Escalate toward block as severity rises and as strictness increases.\n\n"
+    "severity: low | medium | high — the worst issue found (low when there is none).\n"
+    "confidence: 0.0-1.0 — how sure you are the chosen action is correct.\n"
+    "rationale: <=30 words, concrete and specific to this page; no boilerplate.\n\n"
+    "Respond with ONE JSON object and nothing else — no markdown, no code fences, no preamble. "
+    "Keys in this order: is_harmful (bool), categories (array of the labels above), "
+    "severity (low|medium|high), rationale (string), action (allow|notify|warn|blur|block), "
+    "confidence (number 0.0-1.0).\n"
+    'Example: {{"is_harmful": true, "categories": ["adult_sexual"], "severity": "high", '
+    '"rationale": "Explicit pornographic imagery and text throughout the page.", '
+    '"action": "block", "confidence": 0.95}}'
 )
 
 def build_human_prompt(page_title: str, domain: str, fast_scores: Dict[str, float], text_sample: str, child_age: int, strictness: str) -> str:
-    # Keep payload compact (cap text to ~2000 chars)
+    # Keep payload compact (cap text to ~2000 chars) and render scores as JSON so
+    # the model reads clean key/value pairs rather than a Python dict repr.
     text_snippet = (text_sample or "")[:2000]
+    scores = json.dumps(fast_scores or {}, sort_keys=True)
     return (
-        f"PAGE_TITLE: {page_title}\n"
-        f"DOMAIN: {domain}\n"
         f"CHILD_PROFILE: age={child_age}, strictness={strictness}\n"
-        f"FAST_SCORES: {fast_scores}\n"
-        "RISK_HINTS: use URL keywords (nsfw, porn, casino), metadata text, hyperlinks, "
-        "scripts/trackers, sentiment, OCR text for images/videos, and tone for slurs/bullying.\n"
-        f"TEXT_SNIPPET:\n{text_snippet}\n\n"
-        "Return STRICT JSON only."
+        f"DOMAIN: {domain}\n"
+        f"PAGE_TITLE: {page_title or '(none)'}\n"
+        f"FAST_SCORES: {scores}\n"
+        f"TEXT_SAMPLE (may be truncated):\n{text_snippet or '(none)'}\n\n"
+        "Classify this page and reply with only the JSON object."
     )
 
 class LLMJudge:

@@ -100,7 +100,9 @@ class PolicyEngine:
         # LLM judge
         if judge_json:
             act = judge_json.get("action","allow")
-            if act not in ("allow","block"):
+            # allow/block/blur pass through; warn/notify are not enforced yet, so
+            # anything else escalates to block.
+            if act not in ("allow","block","blur"):
                 act = "block"
             cats = judge_json.get("categories",[])
             sev  = judge_json.get("severity","low")

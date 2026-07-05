@@ -634,6 +634,42 @@ class Database:
             )
             return cur.fetchone()
 
+    def get_decision_by_event(self, event_id: str, household_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Latest decision for an event, scoped to a household. Used by the
+        extension to poll for the enforcement decision it must apply."""
+        with self._connect() as conn, conn.cursor() as cur:
+            params: List[Any] = [event_id]
+            scope = ""
+            if household_id:
+                params.append(household_id)
+                scope = " AND d.household_id=%s"
+            cur.execute(
+                f"""
+                SELECT
+                    d.*,
+                    COALESCE(o.action, d.action) AS action,
+                    o.action AS manual_action,
+                    (o.id IS NOT NULL) AS manual_flagged,
+                    EXTRACT(EPOCH FROM o.created_at) * 1000 AS manual_updated_at,
+                    e.url, e.title, e.ts, e.child_id, e.tab_id, e.device_id, e.session_id
+                FROM decisions d
+                JOIN events e ON d.event_id=e.id
+                LEFT JOIN LATERAL (
+                    SELECT *
+                    FROM decision_overrides o
+                    WHERE o.decision_id=d.id
+                    ORDER BY o.created_at DESC
+                    LIMIT 1
+                ) o ON TRUE
+                WHERE d.event_id=%s
+                {scope}
+                ORDER BY d.created_at DESC
+                LIMIT 1
+                """,
+                params,
+            )
+            return cur.fetchone()
+
     def override_decision(
         self,
         decision_id: str,

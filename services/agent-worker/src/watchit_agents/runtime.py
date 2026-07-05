@@ -148,7 +148,9 @@ def _decision_message_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "reason": row.get("reason"),
         "categories": details.get("categories", []),
         "upgrade": False,
-        "needs_ocr": False,
+        # Interim placeholder written while OCR is pending; the extension keeps
+        # polling for the post-OCR final decision instead of applying this one.
+        "needs_ocr": row.get("reason") == "pending_ocr",
         "confidence": details.get("confidence", 1.0),
         "llm_rationale": details.get("rationale"),
         "url": row.get("url"),
