@@ -9,6 +9,8 @@ function isWatchItOrigin(url){
 
 let es = null;
 const eventContextByTab = new Map();
+const eventIdByTab = new Map();
+const inactiveTabs = new Set(); // tabs whose last visit wasn't accepted (monitoring off)
 const upgradedEvents = new Set();
 
 async function getOrCreateInstallId(){
@@ -50,6 +52,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse)=>{
     .then((device)=>sendResponse({ ok: true, device }))
     .catch((err)=>sendResponse({ ok: false, error: String(err) }));
   return true;
+});
+
+// content.js drives the polling timing (page context, survives service-worker
+// eviction) and delegates each fetch here — a message wakes the worker, so the
+// authed request runs even after the worker was evicted. Mixed-content/CORS
+// rules also block a content script on an https page from calling the API directly.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse)=>{
+  if(!msg || msg.type !== "watchit_get_decision") return;
+  (async ()=>{
+    try{
+      const tabId = sender.tab && sender.tab.id;
+      const key = tabId != null ? `c-${tabId}` : null;
+      const eventId = key ? eventIdByTab.get(key) : null;
+      if(!eventId){ sendResponse({ status: key && inactiveTabs.has(key) ? "inactive" : "pending" }); return; }
+      const headers = await authHeaders();
+      if(!headers){ sendResponse({ status: "unpaired" }); return; }
+      const resp = await fetch(`${API}/v1/event/${encodeURIComponent(eventId)}/decision`, { headers });
+      const data = await resp.json().catch(()=>null);
+      // Interim decision needs a screenshot — kick the OCR upgrade so the final
+      // decision gets produced (submitUpgrade is idempotent per event).
+      if(data && data.decision && data.decision.needs_ocr && sender.tab){
+        submitUpgrade(sender.tab, { needs_ocr: true, event_id: eventId, tab_id: `c-${sender.tab.id}` }).catch(()=>{});
+      }
+      sendResponse(data || { status: "pending" });
+    }catch(_){ sendResponse({ status: "pending" }); }
+  })();
+  return true; // async sendResponse
 });
 
 async function submitUpgrade(tab, msg){
@@ -147,6 +176,13 @@ chrome.webNavigation.onCommitted.addListener(async (details)=>{
   try{
     const headers = await authHeaders();
     if(!headers) return;
-    await fetch(`${API}/v1/event`, { method: "POST", headers, body: JSON.stringify(baseEvt) });
+    // New navigation supersedes any prior decision for this tab.
+    const key = `c-${details.tabId}`;
+    eventIdByTab.delete(key);
+    inactiveTabs.delete(key);
+    const resp = await fetch(`${API}/v1/event`, { method: "POST", headers, body: JSON.stringify(baseEvt) });
+    const data = await resp.json().catch(()=>null);
+    if(resp.ok && data && data.event_id) eventIdByTab.set(key, data.event_id);
+    else inactiveTabs.add(key); // e.g. monitoring not active (409) — don't hold the page
   }catch(_){}
 });

@@ -3,10 +3,15 @@ const BLUR_CLASS="__watchit_blur__"; const BANNER_ID="__watchit_warn__"; const I
 // Never run on WatchIt's own surfaces (API + guardian dashboard). Hosts from config.js.
 const IS_WATCHIT_APP=WATCHIT_CONFIG.skipHosts.includes(location.host);
 
-// Fail-open: if no decision arrives (unpaired, monitoring off, worker down),
-// clear the loader after this window so the page is never trapped.
-const LOADER_TIMEOUT_MS=8000;
+// The extension holds the page (loader) until the safety decision arrives,
+// polling for it up to POLL_MAX_MS. Fail-open: if none arrives in that window
+// (unpaired, monitoring off, worker down) the loader clears so the page is
+// never trapped. LOADER_TIMEOUT_MS is a hard safety net matching the poll cap.
+const POLL_INTERVAL_MS=1000;
+const POLL_MAX_MS=20000;
+const LOADER_TIMEOUT_MS=POLL_MAX_MS;
 let loaderTimer=null;
+let decisionApplied=false; // once a decision is applied, stop polling
 
 function ensureStyles(){
   const styleId="__watchit_styles__";
@@ -95,17 +100,11 @@ function block(parts){
   document.documentElement.appendChild(wrap);
 }
 
-// Show a loading screen only on paired browsers, so unmonitored devices are untouched.
-if(!IS_WATCHIT_APP){
-  chrome.storage.local.get(["deviceToken"], (stored)=>{
-    if(stored && stored.deviceToken) showLoading();
-  });
-}
-
-chrome.runtime.onMessage.addListener((msg)=>{
-  if(IS_WATCHIT_APP) return;
-  if(!msg || msg.type!=="watchit_decision") return;
-  const d=msg.payload||{}; const a=d.action;
+function applyDecision(d){
+  // Interim decision while OCR is pending — keep holding and wait for the
+  // post-OCR final decision instead of latching onto the placeholder.
+  if(d && d.needs_ocr){ return; }
+  const a=d.action;
   const rationale = d.llm_rationale;
   const cats=(d.categories||[]);
   const reasonParts=[];
@@ -125,4 +124,42 @@ chrome.runtime.onMessage.addListener((msg)=>{
     unblur();
     block({ rationale, reason: d.reason, categories: cats, url: d.url });
   }
+  decisionApplied=true;
+}
+
+// Poll the service worker (which does the authed API fetch) until the decision
+// for this page is ready. Runs in the page, so it survives the MV3 worker being
+// evicted mid-wait — each message wakes the worker back up.
+function pollForDecision(){
+  const start=Date.now();
+  const tick=()=>{
+    if(decisionApplied) return;
+    if(Date.now()-start > POLL_MAX_MS){ clearLoading(); return; } // fail-open
+    chrome.runtime.sendMessage({ type:"watchit_get_decision" }, (resp)=>{
+      if(decisionApplied) return;
+      if(!chrome.runtime.lastError && resp){
+        // Monitoring off or unpaired for this page — release it, don't keep holding.
+        if(resp.status==="inactive" || resp.status==="unpaired"){ clearLoading(); return; }
+        if(resp.status==="decided" && resp.decision){
+          applyDecision(resp.decision); // no-op if interim (needs_ocr) — keep polling
+        }
+      }
+      if(!decisionApplied) setTimeout(tick, POLL_INTERVAL_MS);
+    });
+  };
+  tick();
+}
+
+// Hold + poll only on paired browsers, so unmonitored devices are untouched.
+if(!IS_WATCHIT_APP){
+  chrome.storage.local.get(["deviceToken"], (stored)=>{
+    if(stored && stored.deviceToken){ showLoading(); pollForDecision(); }
+  });
+}
+
+// Fast path: apply an SSE-pushed decision immediately when the worker is alive.
+chrome.runtime.onMessage.addListener((msg)=>{
+  if(IS_WATCHIT_APP) return;
+  if(!msg || msg.type!=="watchit_decision") return;
+  applyDecision(msg.payload||{});
 });
