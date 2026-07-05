@@ -68,6 +68,24 @@ async def require_guardian_stream(token: str | None = Query(default=None)) -> Di
     return {**claims, **context}
 
 
+async def require_device_stream(token: str | None = Query(default=None)) -> Dict[str, Any]:
+    # EventSource cannot set an Authorization header, so the extension passes its
+    # device token as a query param. Same scoping as require_device.
+    if not token:
+        logger.warning("device_stream_auth_missing")
+        raise HTTPException(401, "Missing stream token")
+    device = db.authenticate_device_token(token)
+    if not device:
+        logger.warning("device_stream_auth_invalid")
+        raise HTTPException(401, "Invalid device token")
+    bind_log_context(
+        device_id=device.get("id"),
+        child_id=device.get("child_id"),
+        household_id=device.get("household_id"),
+    )
+    return {"device": device}
+
+
 async def require_device(authorization: str | None = Header(default=None)) -> Dict[str, Any]:
     if not authorization or not authorization.lower().startswith("bearer "):
         logger.warning("device_auth_missing")

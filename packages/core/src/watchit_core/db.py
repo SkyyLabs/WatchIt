@@ -204,20 +204,75 @@ class Database:
             cur.execute(f"UPDATE children SET {', '.join(updates)} WHERE {where}", params)
 
     def fetch_children(self, household_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        # monitoring_active / active_device_count let the children UI reflect live
+        # state on load without an extra fetch per child.
+        columns = """
+            c.id, c.household_id, c.name, c.timezone, c.strictness, c.age, c.status,
+            c.created_at, c.updated_at,
+            EXISTS(
+                SELECT 1 FROM monitoring_sessions ms
+                WHERE ms.household_id=c.household_id AND ms.child_id=c.id AND ms.status='active'
+            ) AS monitoring_active,
+            (
+                SELECT COUNT(*) FROM devices d
+                WHERE d.household_id=c.household_id AND d.child_id=c.id AND d.status='active'
+            ) AS active_device_count
+        """
         with self._connect() as conn, conn.cursor() as cur:
             if household_id:
                 cur.execute(
-                    """
-                    SELECT id, household_id, name, timezone, strictness, age, status, created_at, updated_at
-                    FROM children
-                    WHERE household_id=%s
-                    ORDER BY created_at ASC
-                    """,
+                    f"SELECT {columns} FROM children c WHERE c.household_id=%s ORDER BY c.created_at ASC",
                     (household_id,),
                 )
             else:
-                cur.execute("SELECT id, household_id, name, timezone, strictness, age, status, created_at, updated_at FROM children ORDER BY created_at ASC")
+                cur.execute(f"SELECT {columns} FROM children c ORDER BY c.created_at ASC")
             return cur.fetchall()
+
+    def fetch_devices(self, household_id: str, child_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, child_id, device_name, browser_name, status,
+                       last_seen_at, paused_until, created_at
+                FROM devices
+                WHERE household_id=%s AND child_id=%s AND status<>'revoked'
+                ORDER BY created_at DESC
+                """,
+                (household_id, child_id),
+            )
+            return cur.fetchall()
+
+    def get_device_paused_until(self, device_id: str) -> Optional[int]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT paused_until FROM devices WHERE id=%s", (device_id,))
+            row = cur.fetchone()
+            return row["paused_until"] if row else None
+
+    def set_device_pause(self, household_id: str, device_id: str, paused_until_ms: int) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET paused_until=%s, updated_at=now() WHERE id=%s AND household_id=%s",
+                (paused_until_ms, device_id, household_id),
+            )
+            return cur.rowcount
+
+    def clear_device_pause(self, household_id: str, device_id: str) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET paused_until=NULL, updated_at=now() WHERE id=%s AND household_id=%s",
+                (device_id, household_id),
+            )
+            return cur.rowcount
+
+    def revoke_device(self, household_id: str, device_id: str) -> int:
+        # Revoking retires a stale/duplicate device: it drops out of the list and its
+        # token stops authenticating (authenticate_device_token requires status='active').
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET status='revoked', updated_at=now() WHERE id=%s AND household_id=%s AND status<>'revoked'",
+                (device_id, household_id),
+            )
+            return cur.rowcount
 
     def add_event(self, event: Dict[str, Any]) -> str:
         event_id = event.get("id") or f"evt_{uuid.uuid4().hex}"

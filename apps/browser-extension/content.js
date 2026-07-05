@@ -1,4 +1,12 @@
-const BLUR_CLASS="__watchit_blur__"; const BANNER_ID="__watchit_warn__"; const INTERSTITIAL_ID="__watchit_block__";
+const BLUR_CLASS="__watchit_blur__"; const BANNER_ID="__watchit_warn__"; const INTERSTITIAL_ID="__watchit_block__"; const LOADER_ID="__watchit_loading__";
+
+// Never run on WatchIt's own surfaces (API + guardian dashboard). Hosts from config.js.
+const IS_WATCHIT_APP=WATCHIT_CONFIG.skipHosts.includes(location.host);
+
+// Fail-open: if no decision arrives (unpaired, monitoring off, worker down),
+// clear the loader after this window so the page is never trapped.
+const LOADER_TIMEOUT_MS=8000;
+let loaderTimer=null;
 
 function ensureStyles(){
   const styleId="__watchit_styles__";
@@ -6,8 +14,23 @@ function ensureStyles(){
   const s=document.createElement("style"); s.id=styleId;
   s.textContent=`
     .${BLUR_CLASS} img, .${BLUR_CLASS} video, .${BLUR_CLASS} canvas, .${BLUR_CLASS} * { filter: blur(14px)!important; }
+    /* Keep WatchIt's own UI crisp — id specificity overrides the .blur * rule above. */
+    #${BANNER_ID}, #${BANNER_ID} *, #${INTERSTITIAL_ID}, #${INTERSTITIAL_ID} *, #${LOADER_ID}, #${LOADER_ID} * { filter: none!important; }
     #${BANNER_ID}{position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#ffcc00;color:#000;padding:10px;text-align:center;font-family:sans-serif;box-shadow:0 2px 6px rgba(0,0,0,0.2)}
-    #${INTERSTITIAL_ID}{position:fixed;inset:0;background:#111;color:#fff;display:flex;align-items:center;justify-content:center;z-index:2147483647;font-family:sans-serif}
+    #${LOADER_ID}{position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;background:rgba(15,17,26,0.96);backdrop-filter:blur(6px);color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+    #${LOADER_ID} .__wi_spin{width:44px;height:44px;border-radius:50%;border:4px solid rgba(255,255,255,0.18);border-top-color:#6366f1;animation:__wi_rot 0.8s linear infinite}
+    #${LOADER_ID} .__wi_label{font-size:15px;font-weight:500;letter-spacing:.2px}
+    #${LOADER_ID} .__wi_sub{font-size:12px;color:#9ca3af}
+    @keyframes __wi_rot{to{transform:rotate(360deg)}}
+    #${INTERSTITIAL_ID}{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:24px;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:radial-gradient(1200px 600px at 50% -10%,#1e293b 0%,#0b0f1a 60%)}
+    #${INTERSTITIAL_ID} .__wi_card{max-width:520px;width:100%;background:#111726;border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:34px 30px;box-shadow:0 30px 80px rgba(0,0,0,0.55);color:#e5e7eb;text-align:center}
+    #${INTERSTITIAL_ID} .__wi_badge{width:64px;height:64px;margin:0 auto 18px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:30px;background:rgba(239,68,68,0.14);border:1px solid rgba(239,68,68,0.35)}
+    #${INTERSTITIAL_ID} h1{margin:0 0 8px;font-size:22px;font-weight:700;color:#fff}
+    #${INTERSTITIAL_ID} .__wi_tag{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;color:#f87171;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);padding:4px 10px;border-radius:999px;margin-bottom:16px}
+    #${INTERSTITIAL_ID} .__wi_reason{font-size:15px;line-height:1.5;color:#cbd5e1;margin:0 0 18px}
+    #${INTERSTITIAL_ID} .__wi_cats{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:18px}
+    #${INTERSTITIAL_ID} .__wi_cats span{font-size:12px;font-weight:600;color:#fca5a5;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.28);padding:4px 12px;border-radius:999px}
+    #${INTERSTITIAL_ID} .__wi_meta{font-size:12px;color:#6b7280;border-top:1px solid rgba(255,255,255,0.07);padding-top:16px;margin-top:6px;word-break:break-all}
   `;
   document.documentElement.appendChild(s);
 }
@@ -16,37 +39,90 @@ ensureStyles();
 
 function applyBlur(){ document.documentElement.classList.add(BLUR_CLASS); }
 function unblur(){ document.documentElement.classList.remove(BLUR_CLASS); }
+
+function showLoading(){
+  if(document.getElementById(LOADER_ID)) return;
+  const el=document.createElement("div"); el.id=LOADER_ID;
+  const spin=document.createElement("div"); spin.className="__wi_spin";
+  const label=document.createElement("div"); label.className="__wi_label"; label.textContent="WatchIt is checking this page…";
+  const sub=document.createElement("div"); sub.className="__wi_sub"; sub.textContent="Waiting for the safety decision";
+  el.appendChild(spin); el.appendChild(label); el.appendChild(sub);
+  document.documentElement.appendChild(el);
+  loaderTimer=setTimeout(clearLoading, LOADER_TIMEOUT_MS);
+}
+function clearLoading(){
+  if(loaderTimer){ clearTimeout(loaderTimer); loaderTimer=null; }
+  const el=document.getElementById(LOADER_ID); if(el) el.remove();
+}
+
 function warn(reason){
   let el=document.getElementById(BANNER_ID);
   if(!el){ el=document.createElement("div"); el.id=BANNER_ID; document.documentElement.appendChild(el); }
   el.textContent=`WatchIt: This page may need supervision (${reason}).`;
 }
 function clearWarn(){ const el=document.getElementById(BANNER_ID); if(el) el.remove(); }
-function block(reason){
-  document.documentElement.innerHTML=`<div id="${INTERSTITIAL_ID}"><div><h1>Blocked by WatchIt</h1><p>Reason: ${reason}</p></div></div>`;
+
+function block(parts){
+  const card=document.createElement("div"); card.className="__wi_card";
+
+  const badge=document.createElement("div"); badge.className="__wi_badge"; badge.textContent="🛡️";
+  const tag=document.createElement("div"); tag.className="__wi_tag"; tag.textContent="Blocked by WatchIt";
+  const h1=document.createElement("h1"); h1.textContent="This page is blocked";
+  card.appendChild(badge); card.appendChild(tag); card.appendChild(h1);
+
+  const reason=document.createElement("p"); reason.className="__wi_reason";
+  reason.textContent = parts.rationale || parts.reason || "This content was flagged as unsuitable.";
+  card.appendChild(reason);
+
+  if(parts.categories && parts.categories.length){
+    const cats=document.createElement("div"); cats.className="__wi_cats";
+    parts.categories.forEach((c)=>{ const s=document.createElement("span"); s.textContent=c; cats.appendChild(s); });
+    card.appendChild(cats);
+  }
+
+  const metaBits=[];
+  if(parts.reason && parts.reason!==reason.textContent) metaBits.push(`Policy: ${parts.reason}`);
+  if(parts.url) metaBits.push(parts.url);
+  if(metaBits.length){
+    const meta=document.createElement("div"); meta.className="__wi_meta"; meta.textContent=metaBits.join("  ·  ");
+    card.appendChild(meta);
+  }
+
+  // Cover the page with a fixed overlay instead of wiping the DOM: wiping fights
+  // SPA re-hydration (breaks layout) and drops our own style node.
+  const existing=document.getElementById(INTERSTITIAL_ID); if(existing) existing.remove();
+  const wrap=document.createElement("div"); wrap.id=INTERSTITIAL_ID; wrap.appendChild(card);
+  document.documentElement.appendChild(wrap);
+}
+
+// Show a loading screen only on paired browsers, so unmonitored devices are untouched.
+if(!IS_WATCHIT_APP){
+  chrome.storage.local.get(["deviceToken"], (stored)=>{
+    if(stored && stored.deviceToken) showLoading();
+  });
 }
 
 chrome.runtime.onMessage.addListener((msg)=>{
+  if(IS_WATCHIT_APP) return;
   if(!msg || msg.type!=="watchit_decision") return;
   const d=msg.payload||{}; const a=d.action;
   const rationale = d.llm_rationale;
-  const cats=(d.categories||[]).join(", ");
+  const cats=(d.categories||[]);
   const reasonParts=[];
   if(rationale) reasonParts.push(rationale);
   if(d.reason) reasonParts.push(d.reason);
-  if(cats) reasonParts.push(`categories: ${cats}`);
+  if(cats.length) reasonParts.push(`categories: ${cats.join(", ")}`);
   const r=reasonParts.join(" | ") || "policy";
   clearWarn();
+  clearLoading();
   if(a==="allow"){
     unblur();
-  } else if(a==="warn"){
-    applyBlur();
-    warn(r);
-  } else if(a==="blur"){
+  } else if(a==="warn" || a==="blur"){
     applyBlur();
     warn(r);
   } else if(a==="block"){
-    applyBlur();
-    block(r);
+    // Block replaces the whole page with the interstitial; blurring it would hide the text.
+    unblur();
+    block({ rationale, reason: d.reason, categories: cats, url: d.url });
   }
 });

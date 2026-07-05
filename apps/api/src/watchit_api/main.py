@@ -15,7 +15,7 @@ from watchit_core.config import settings
 from watchit_agents.runtime import process_event, bus, publish_decision_row
 from watchit_agents.worker import AgentWorker
 from watchit_learning.guardian_learning import GuardianLearningLoop
-from watchit_api.auth import require_device, require_guardian, require_guardian_stream
+from watchit_api.auth import require_device, require_device_stream, require_guardian, require_guardian_stream
 from watchit_core.logging import bind_log_context, clear_log_context, configure_logging, get_logger
 from watchit_core.url_cache import url_cache_key
 
@@ -133,6 +133,12 @@ class ChildSettingsPayload(BaseModel):
     age: Optional[int] = None
     name: Optional[str] = None
 
+class ChildCreatePayload(BaseModel):
+    child_id: str
+    name: str
+    strictness: Optional[Literal["lenient","standard","strict"]] = None
+    age: Optional[int] = None
+
 class DecisionOverridePayload(BaseModel):
     action: Literal["allow","warn","blur","block","notify"]
     reason: Optional[str] = None
@@ -152,6 +158,14 @@ class PairingRedeemPayload(BaseModel):
 class MonitoringPayload(BaseModel):
     child_id: Optional[str] = None
     device_id: Optional[str] = None
+
+class DevicePatchPayload(BaseModel):
+    paused_until_minutes: int
+    pin: Optional[str] = None
+
+class ControlPatchPayload(BaseModel):
+    paused_until_minutes: int
+    pin: Optional[str] = None
 
 @app.post("/v1/event")
 async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
@@ -223,6 +237,18 @@ async def stream_decisions(guardian_ctx=Depends(require_guardian_stream)):
         background=BackgroundTask(bus.unsubscribe, q),
     )
 
+@app.get("/v1/device/stream/decisions")
+async def stream_device_decisions(device_ctx=Depends(require_device_stream)):
+    from watchit_api.sse import sse_generator
+    household_id = device_ctx["device"]["household_id"]
+    q = bus.subscribe()
+    logger.info("device_decision_stream_subscribed")
+    return StreamingResponse(
+        sse_generator(q, household_id=household_id),
+        media_type="text/event-stream",
+        background=BackgroundTask(bus.unsubscribe, q),
+    )
+
 @app.get("/v1/settings/security")
 async def get_security_settings(guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
@@ -251,39 +277,26 @@ async def set_parent_pin(payload: ParentPinPayload, guardian_ctx=Depends(require
     logger.info("parent_pin_updated", pin_previously_set=pin_exists)
     return {"ok": True, "parent_pin_set": True}
 
-@app.post("/v1/control/pause")
-async def control_pause(body: PausePayload, guardian_ctx=Depends(require_guardian)):
+@app.patch("/v1/control")
+async def patch_control(body: ControlPatchPayload, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     guardian_id = guardian_ctx["guardian"]["id"]
+    if body.paused_until_minutes == 0:
+        db.delete_setting("paused_until", household_id)
+        log_service_event("monitor_resumed")
+        logger.info("monitor_resumed")
+        return {"ok": True, "paused_until": None}
     if not db.is_parent_pin_set(household_id):
         raise HTTPException(409, "parent_pin_required")
-    if not db.verify_parent_pin(body.pin, household_id):
+    if not db.verify_parent_pin(body.pin or "", household_id):
         raise HTTPException(403, "Invalid PIN")
-    import time
-    # If minutes not provided or <=0, treat as an indefinite pause (10-year horizon).
-    minutes = body.minutes if body.minutes is not None else 0
+    minutes = body.paused_until_minutes
     horizon_minutes = minutes if minutes > 0 else 10 * 365 * 24 * 60
-    until_ms = int(time.time()*1000 + horizon_minutes*60*1000)
+    until_ms = int(time.time() * 1000 + horizon_minutes * 60 * 1000)
     db.set_setting("paused_until", str(until_ms), household_id, guardian_id)
-    logger.info(
-        "monitor_paused",
-        minutes_requested=minutes,
-        effective_minutes=horizon_minutes,
-        paused_until_ms=until_ms,
-    )
-    log_service_event(
-        "monitor_paused",
-        {"minutes_requested": minutes, "effective_minutes": horizon_minutes, "paused_until_ms": until_ms},
-    )
+    log_service_event("monitor_paused", {"minutes_requested": minutes, "paused_until_ms": until_ms})
+    logger.info("monitor_paused", minutes_requested=minutes, paused_until_ms=until_ms)
     return {"ok": True, "paused_until": until_ms}
-
-@app.post("/v1/control/resume")
-async def control_resume(body: ResumePayload, guardian_ctx=Depends(require_guardian)):
-    household_id = guardian_ctx["household"]["id"]
-    db.delete_setting("paused_until", household_id)
-    log_service_event("monitor_resumed")
-    logger.info("monitor_resumed")
-    return {"ok": True}
 
 @app.get("/v1/children")
 async def list_children(guardian_ctx=Depends(require_guardian)):
@@ -292,22 +305,41 @@ async def list_children(guardian_ctx=Depends(require_guardian)):
     logger.info("children_requested", count=len(children))
     return {"children": children, "active_child_id": db.get_active_child_id(household_id)}
 
-@app.post("/v1/children/{child_id}/settings")
-async def update_child(child_id: str, payload: ChildSettingsPayload, guardian_ctx=Depends(require_guardian)):
+@app.get("/v1/children/{child_id}/devices")
+async def list_child_devices(child_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    if not db.get_child_profile(child_id, household_id):
+        raise HTTPException(404, "child not found")
+    return {"devices": db.fetch_devices(household_id, child_id)}
+
+@app.post("/v1/children")
+async def create_child(payload: ChildCreatePayload, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     guardian_id = guardian_ctx["guardian"]["id"]
     if payload.age is not None and (payload.age < 3 or payload.age > 18):
         raise HTTPException(400, "age must be between 3 and 18")
-    if payload.strictness is None and payload.age is None and payload.name is None:
-        raise HTTPException(400, "provide strictness, age, and/or name")
-    display_name = payload.name.strip() if payload.name else None
-    db.add_child_profile(child_id, household_id=household_id, name=display_name or child_id)
-    db.update_child_profile(child_id, strictness=payload.strictness, age=payload.age, household_id=household_id, name=display_name)
-    profile = db.get_child_profile(child_id, household_id) or {}
-    db.set_active_child_id(child_id, household_id, guardian_id)
-    db.log_audit(household_id, "child_settings_updated", guardian_id=guardian_id, entity_type="child", entity_id=child_id, metadata=payload.model_dump())
-    logger.info("child_settings_updated", child_id=child_id, strictness=payload.strictness, age=payload.age)
+    display_name = payload.name.strip() if payload.name else ""
+    if not display_name:
+        raise HTTPException(400, "name is required")
+    db.add_child_profile(payload.child_id, household_id=household_id, name=display_name)
+    db.update_child_profile(payload.child_id, strictness=payload.strictness, age=payload.age, household_id=household_id, name=display_name)
+    profile = db.get_child_profile(payload.child_id, household_id) or {}
+    db.set_active_child_id(payload.child_id, household_id, guardian_id)
+    db.log_audit(household_id, "child_created", guardian_id=guardian_id, entity_type="child", entity_id=payload.child_id, metadata=payload.model_dump())
+    logger.info("child_created", child_id=payload.child_id, strictness=payload.strictness, age=payload.age)
     return {"child": profile}
+
+@app.patch("/v1/children/{child_id}")
+async def patch_child(child_id: str, body: ChildSettingsPayload, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if not db.get_child_profile(child_id, household_id):
+        raise HTTPException(404, "child not found")
+    if body.age is not None and (body.age < 3 or body.age > 18):
+        raise HTTPException(400, "age must be between 3 and 18")
+    db.update_child_profile(child_id, strictness=body.strictness, age=body.age, household_id=household_id, name=body.name)
+    db.log_audit(household_id, "child_settings_updated", guardian_id=guardian_id, entity_type="child", entity_id=child_id)
+    return {"ok": True}
 
 @app.post("/v1/decisions/{decision_id}/override")
 async def override_decision(decision_id: str, payload: DecisionOverridePayload, guardian_ctx=Depends(require_guardian)):
@@ -392,6 +424,37 @@ async def redeem_pairing_code(payload: PairingRedeemPayload):
     device = result["device"]
     db.log_audit(device["household_id"], "device_paired", device_id=device["id"], entity_type="device", entity_id=device["id"])
     return {"device": device, "device_token": result["device_token"]}
+
+@app.patch("/v1/devices/{device_id}")
+async def patch_device(device_id: str, body: DevicePatchPayload, guardian_ctx=Depends(require_guardian)):
+    import time
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if body.paused_until_minutes <= 0:
+        db.clear_device_pause(household_id, device_id)
+        db.log_audit(household_id, "device_resumed", guardian_id=guardian_id, device_id=device_id, entity_type="device", entity_id=device_id)
+        logger.info("device_resumed", device_id=device_id)
+        return {"ok": True, "paused_until": None}
+    if not db.is_parent_pin_set(household_id):
+        raise HTTPException(409, "parent_pin_required")
+    if not db.verify_parent_pin(body.pin or "", household_id):
+        raise HTTPException(403, "Invalid PIN")
+    until_ms = int(time.time() * 1000 + body.paused_until_minutes * 60 * 1000)
+    if db.set_device_pause(household_id, device_id, until_ms) == 0:
+        raise HTTPException(404, "device not found")
+    db.log_audit(household_id, "device_paused", guardian_id=guardian_id, device_id=device_id, entity_type="device", entity_id=device_id, metadata={"minutes": body.paused_until_minutes})
+    logger.info("device_paused", device_id=device_id, paused_until_ms=until_ms)
+    return {"ok": True, "paused_until": until_ms}
+
+@app.delete("/v1/devices/{device_id}")
+async def revoke_device(device_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if db.revoke_device(household_id, device_id) == 0:
+        raise HTTPException(404, "device not found")
+    db.log_audit(household_id, "device_revoked", guardian_id=guardian_id, device_id=device_id, entity_type="device", entity_id=device_id)
+    logger.info("device_revoked", device_id=device_id)
+    return {"ok": True}
 
 @app.post("/v1/monitoring/start")
 async def start_monitoring(payload: MonitoringPayload, guardian_ctx=Depends(require_guardian)):

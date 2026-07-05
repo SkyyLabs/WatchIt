@@ -37,6 +37,13 @@ def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000, 2)
 
 
+def effective_pause_until(db, household_id, device_id):
+    household = db.get_paused_until(household_id)
+    device = db.get_device_paused_until(device_id) if device_id else None
+    candidates = [c for c in (household, device) if c]
+    return max(candidates) if candidates else None
+
+
 def _extract_screenshots(event: Dict[str, Any]) -> list[str]:
     payload = event.get("data_json")
     if not payload:
@@ -179,10 +186,10 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
     bind_log_context(event_id=event_id, household_id=household_id, child_id=event.get("child_id"), tab_id=event.get("tab_id"), upgrade=upgrade)
     logger.info("event_processing_started", url=event.get("url"), db_event_write_ms=db_event_write_ms)
 
-    # Global pause gate: short-circuit the pipeline while paused.
+    # Global + per-device pause gate: short-circuit the pipeline while paused.
     pause_started = time.perf_counter()
     now_ms = int(time.time() * 1000)
-    paused_until = db.get_paused_until(household_id)
+    paused_until = effective_pause_until(db, household_id, event.get("device_id"))
     pause_check_ms = _elapsed_ms(pause_started)
     if paused_until and now_ms < paused_until:
         log_service_event(

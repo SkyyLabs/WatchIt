@@ -20,6 +20,7 @@ import {
   Settings,
   Shield,
   UserRound,
+  Users,
   UsersRound,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -47,6 +48,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ChildrenView } from "@/components/dashboard/children-view";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -109,6 +111,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
   const [isPausedManual, setIsPausedManual] = useState(false);
   const [pausedUntilMs, setPausedUntilMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [authToken, setAuthToken] = useState<string | null>(null);
   const esRef = useRef<EventSource | null>(null);
 
   const token = useCallback(() => getToken(), [getToken]);
@@ -119,6 +122,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
     setLoading(true);
     try {
       const authToken = await token();
+      setAuthToken(authToken);
       const [childrenResp, decisionsResp, eventsResp, securityResp] = await Promise.all([
         apiFetch<{ children: ChildProfile[]; active_child_id: string | null }>("/v1/children", authToken),
         apiFetch<{ decisions: DecisionRecord[] }>("/v1/decisions?limit=200", authToken),
@@ -172,6 +176,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
       setDecisions([]);
       setSelectedChild(null);
       setSecurity(null);
+      setAuthToken(null);
       if (esRef.current) {
         esRef.current.close();
         esRef.current = null;
@@ -253,9 +258,9 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
     const childId = makeChildId(form.name);
     if (!childId) throw new Error("Enter a child name.");
     const authToken = await token();
-    await apiFetch(`/v1/children/${encodeURIComponent(childId)}/settings`, authToken, {
+    await apiFetch(`/v1/children`, authToken, {
       method: "POST",
-      body: JSON.stringify({ name: form.name.trim(), strictness: form.strictness, age: form.age }),
+      body: JSON.stringify({ child_id: childId, name: form.name.trim(), strictness: form.strictness, age: form.age }),
     });
     setChildDialogOpen(false);
     await refreshAll();
@@ -265,8 +270,8 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
   const handleUpdateChild = async (form: ChildFormState) => {
     if (!selectedChild) return;
     const authToken = await token();
-    await apiFetch(`/v1/children/${encodeURIComponent(selectedChild)}/settings`, authToken, {
-      method: "POST",
+    await apiFetch(`/v1/children/${encodeURIComponent(selectedChild)}`, authToken, {
+      method: "PATCH",
       body: JSON.stringify({ name: form.name.trim(), strictness: form.strictness, age: form.age }),
     });
     setChildDialogOpen(false);
@@ -309,11 +314,12 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
 
   const pauseMonitoring = async () => {
     try {
-      const mins = parseInt(pauseMinutes || "0", 10);
+      const raw = parseInt(pauseMinutes, 10);
+      const mins = Number.isFinite(raw) && raw > 0 ? raw : -1; // blank/invalid = indefinite pause (API maps <0 to 10y; 0 is resume)
       const authToken = await token();
-      const data = await apiFetch<{ ok: boolean; paused_until: number }>("/v1/control/pause", authToken, {
-        method: "POST",
-        body: JSON.stringify({ pin: pausePin, minutes: Number.isFinite(mins) ? mins : undefined }),
+      const data = await apiFetch<{ ok: boolean; paused_until: number | null }>("/v1/control", authToken, {
+        method: "PATCH",
+        body: JSON.stringify({ paused_until_minutes: mins, pin: pausePin }),
       });
       setIsPausedManual(true);
       setPausedUntilMs(data.paused_until);
@@ -333,7 +339,10 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
 
   const resumeMonitoring = async () => {
     const authToken = await token();
-    await apiFetch("/v1/control/resume", authToken, { method: "POST", body: JSON.stringify({}) });
+    await apiFetch("/v1/control", authToken, {
+      method: "PATCH",
+      body: JSON.stringify({ paused_until_minutes: 0 }),
+    });
     setIsPausedManual(false);
     setPausedUntilMs(null);
     localStorage.removeItem("paused_until");
@@ -366,6 +375,31 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
       body: JSON.stringify({ child_id: selectedChild }),
     });
     setMonitoringSession(null);
+  };
+
+  const createPairingCodeForChild = async (childId: string): Promise<string | null> => {
+    const authToken = await token();
+    const data = await apiFetch<{ pairing_code: { code: string } }>("/v1/device/pairing-codes", authToken, {
+      method: "POST",
+      body: JSON.stringify({ child_id: childId, ttl_minutes: 15 }),
+    });
+    return data.pairing_code?.code || null;
+  };
+
+  const startMonitoringForChild = async (childId: string) => {
+    const authToken = await token();
+    await apiFetch("/v1/monitoring/start", authToken, {
+      method: "POST",
+      body: JSON.stringify({ child_id: childId }),
+    });
+  };
+
+  const stopMonitoringForChild = async (childId: string) => {
+    const authToken = await token();
+    await apiFetch("/v1/monitoring/stop", authToken, {
+      method: "POST",
+      body: JSON.stringify({ child_id: childId }),
+    });
   };
 
   const overrideDecision = async (decisionId: string, action: string) => {
@@ -441,6 +475,14 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
             />
           ) : initialView === "profile" ? (
             <ProfileView user={user} />
+          ) : initialView === "children" ? (
+            <ChildrenView
+              children={children}
+              getToken={token}
+              onCreatePairingCode={createPairingCodeForChild}
+              onStartMonitoring={startMonitoringForChild}
+              onStopMonitoring={stopMonitoringForChild}
+            />
           ) : (
             <HomeDashboardView
               needsOnboarding={needsOnboarding}
@@ -532,6 +574,7 @@ function AppShell({ activeView, userName, children }: { activeView: DashboardRou
     { view: "dashboard", href: "/", label: "Dashboard", icon: CircleGauge },
     { view: "settings", href: "/settings", label: "Settings", icon: Settings },
     { view: "profile", href: "/profile", label: "Profile", icon: UserRound },
+    { view: "children", href: "/children", label: "Children", icon: Users },
   ] as const;
   return (
     <div className="mx-auto grid min-h-screen w-full max-w-7xl grid-cols-1 gap-0 lg:grid-cols-[240px_1fr]">

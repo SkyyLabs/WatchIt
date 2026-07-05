@@ -1,4 +1,11 @@
-const API = "http://127.0.0.1:4849";
+importScripts("config.js");
+
+const API = WATCHIT_CONFIG.apiBase;
+
+// WatchIt's own surfaces (API + guardian dashboard) must never be monitored/blocked.
+function isWatchItOrigin(url){
+  try { return WATCHIT_CONFIG.skipHosts.includes(new URL(url).host); } catch(_) { return false; }
+}
 
 let es = null;
 const eventContextByTab = new Map();
@@ -67,9 +74,11 @@ async function submitUpgrade(tab, msg){
   });
 }
 
-function connectSSE(){
+async function connectSSE(){
   if(es) es.close();
-  es = new EventSource(`${API}/v1/stream/decisions`);
+  const stored = await chrome.storage.local.get(["deviceToken"]);
+  if(!stored.deviceToken){ setTimeout(connectSSE, 1500); return; }
+  es = new EventSource(`${API}/v1/device/stream/decisions?token=${encodeURIComponent(stored.deviceToken)}`);
   es.onmessage = (e)=>{
     try{
       const msg = JSON.parse(e.data);
@@ -119,6 +128,7 @@ async function captureTabScreenshot(windowId){
 
 chrome.webNavigation.onCommitted.addListener(async (details)=>{
   if(details.frameId !== 0) return;
+  if(!/^https?:/.test(details.url) || isWatchItOrigin(details.url)) return;
   const tab = await chrome.tabs.get(details.tabId);
   const domSample = await getDomSample(details.tabId);
 
