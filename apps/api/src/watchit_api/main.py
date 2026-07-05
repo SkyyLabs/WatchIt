@@ -335,6 +335,8 @@ async def patch_child(child_id: str, body: ChildSettingsPayload, guardian_ctx=De
     guardian_id = guardian_ctx["guardian"]["id"]
     if not db.get_child_profile(child_id, household_id):
         raise HTTPException(404, "child not found")
+    if body.age is not None and (body.age < 3 or body.age > 18):
+        raise HTTPException(400, "age must be between 3 and 18")
     db.update_child_profile(child_id, strictness=body.strictness, age=body.age, household_id=household_id, name=body.name)
     db.log_audit(household_id, "child_settings_updated", guardian_id=guardian_id, entity_type="child", entity_id=child_id)
     return {"ok": True}

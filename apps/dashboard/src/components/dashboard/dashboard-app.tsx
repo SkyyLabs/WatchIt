@@ -314,11 +314,12 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
 
   const pauseMonitoring = async () => {
     try {
-      const mins = parseInt(pauseMinutes || "0", 10);
+      const raw = parseInt(pauseMinutes, 10);
+      const mins = Number.isFinite(raw) && raw > 0 ? raw : -1; // blank/invalid = indefinite pause (API maps <0 to 10y; 0 is resume)
       const authToken = await token();
       const data = await apiFetch<{ ok: boolean; paused_until: number | null }>("/v1/control", authToken, {
         method: "PATCH",
-        body: JSON.stringify({ paused_until_minutes: Number.isFinite(mins) ? mins : undefined, pin: pausePin }),
+        body: JSON.stringify({ paused_until_minutes: mins, pin: pausePin }),
       });
       setIsPausedManual(true);
       setPausedUntilMs(data.paused_until);
