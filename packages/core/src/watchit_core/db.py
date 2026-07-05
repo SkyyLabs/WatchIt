@@ -10,9 +10,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-import psycopg
+import threading
+
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
+from psycopg_pool import ConnectionPool
 
 from watchit_core.config import settings
 from watchit_core.migrations import run_migrations
@@ -28,15 +30,44 @@ class Database:
 
     def __init__(self, dsn: Optional[str] = None):
         self.dsn = dsn
+        self._pool: ConnectionPool | None = None
+        self._pool_lock = threading.Lock()
 
     def connect(self) -> None:
         run_migrations(self.dsn)
 
+    def _get_pool(self) -> ConnectionPool:
+        if self._pool is None:
+            with self._pool_lock:
+                if self._pool is None:
+                    dsn = self.dsn or settings.database_url
+                    if not dsn:
+                        raise RuntimeError("DATABASE_URL is required")
+                    # Pooled connections avoid a fresh TCP+TLS handshake to Neon on
+                    # every query. check_connection validates a conn before handing
+                    # it out so idle Neon connections that dropped are recycled.
+                    pool = ConnectionPool(
+                        dsn,
+                        min_size=1,
+                        max_size=10,
+                        kwargs={"row_factory": dict_row},
+                        check=ConnectionPool.check_connection,
+                        open=False,
+                    )
+                    pool.open()
+                    self._pool = pool
+        return self._pool
+
     def _connect(self):
-        dsn = self.dsn or settings.database_url
-        if not dsn:
-            raise RuntimeError("DATABASE_URL is required")
-        return psycopg.connect(dsn, row_factory=dict_row)
+        # Returns a context manager that yields a pooled connection and returns it
+        # to the pool on exit (commit on success, rollback on error) — same
+        # `with self._connect() as conn` call sites as before.
+        return self._get_pool().connection()
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
 
     def init_schema(self) -> None:
         """Compatibility wrapper. Schema is owned by Alembic."""
