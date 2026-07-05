@@ -446,6 +446,16 @@ async def patch_device(device_id: str, body: DevicePatchPayload, guardian_ctx=De
     logger.info("device_paused", device_id=device_id, paused_until_ms=until_ms)
     return {"ok": True, "paused_until": until_ms}
 
+@app.delete("/v1/devices/{device_id}")
+async def revoke_device(device_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if db.revoke_device(household_id, device_id) == 0:
+        raise HTTPException(404, "device not found")
+    db.log_audit(household_id, "device_revoked", guardian_id=guardian_id, device_id=device_id, entity_type="device", entity_id=device_id)
+    logger.info("device_revoked", device_id=device_id)
+    return {"ok": True}
+
 @app.post("/v1/monitoring/start")
 async def start_monitoring(payload: MonitoringPayload, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]

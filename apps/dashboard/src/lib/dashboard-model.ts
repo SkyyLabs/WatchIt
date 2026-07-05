@@ -12,6 +12,8 @@ export type ChildProfile = {
   strictness?: "lenient" | "standard" | "strict" | string;
   age?: number;
   status?: string;
+  monitoring_active?: boolean;
+  active_device_count?: number;
 };
 
 export type SecuritySettings = {
