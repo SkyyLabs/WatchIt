@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any, Dict
 
 import jwt
@@ -11,6 +13,28 @@ from watchit_core.logging import bind_log_context, get_logger
 
 _jwks_client: jwt.PyJWKClient | None = None
 logger = get_logger("watchit.auth")
+
+# ensure_guardian_household() writes (last_seen upsert) and resolves the household
+# on every call. Cache the resolved {guardian, household} per Clerk subject so the
+# common case skips the DB entirely; TTL bounds staleness for membership changes.
+_HOUSEHOLD_CACHE_TTL_SECONDS = 300
+_household_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_household_cache_lock = threading.Lock()
+
+
+def _resolve_household(claims: Dict[str, Any]) -> Dict[str, Any]:
+    subject = claims.get("sub")
+    now = time.monotonic()
+    if subject:
+        with _household_cache_lock:
+            cached = _household_cache.get(subject)
+            if cached and cached[0] > now:
+                return cached[1]
+    context = db.ensure_guardian_household(claims)
+    if subject:
+        with _household_cache_lock:
+            _household_cache[subject] = (now + _HOUSEHOLD_CACHE_TTL_SECONDS, context)
+    return context
 
 
 def _jwks_client_for_settings() -> jwt.PyJWKClient:
@@ -42,12 +66,14 @@ def verify_clerk_token(token: str) -> Dict[str, Any]:
         raise HTTPException(401, "Invalid Clerk token") from exc
 
 
-async def require_guardian(authorization: str | None = Header(default=None)) -> Dict[str, Any]:
+# Sync def so FastAPI runs it (and its blocking DB work on cache miss) in a
+# threadpool instead of on the event loop, keeping read endpoints concurrent.
+def require_guardian(authorization: str | None = Header(default=None)) -> Dict[str, Any]:
     if not authorization or not authorization.lower().startswith("bearer "):
         logger.warning("guardian_auth_missing")
         raise HTTPException(401, "Missing bearer token")
     claims = verify_clerk_token(authorization.split(" ", 1)[1].strip())
-    context = db.ensure_guardian_household(claims)
+    context = _resolve_household(claims)
     bind_log_context(
         guardian_id=context["guardian"].get("id"),
         household_id=context["household"].get("id"),
@@ -60,7 +86,7 @@ async def require_guardian_stream(token: str | None = Query(default=None)) -> Di
         logger.warning("guardian_stream_auth_missing")
         raise HTTPException(401, "Missing stream token")
     claims = verify_clerk_token(token)
-    context = db.ensure_guardian_household(claims)
+    context = _resolve_household(claims)
     bind_log_context(
         guardian_id=context["guardian"].get("id"),
         household_id=context["household"].get("id"),

@@ -106,6 +106,7 @@ async def _shutdown():
         except asyncio.CancelledError:
             pass
         _learning_task = None
+    db.close()
 
 PIN_POLICY = {"min_length": 4, "max_length": 8, "digits_only": True}
 
@@ -214,13 +215,13 @@ async def post_event_upgrade(evt: UpgradeInput, device_ctx=Depends(require_devic
         raise HTTPException(500, "internal error")
 
 @app.get("/v1/events")
-async def get_events(child_id: str | None = None, limit: int = 50, guardian_ctx=Depends(require_guardian)):
+def get_events(child_id: str | None = None, limit: int = 50, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     logger.info("events_requested", child_id=child_id, limit=limit)
     return {"events": db.get_recent_events(child_id, limit, household_id)}
 
 @app.get("/v1/decisions")
-async def get_decisions(child_id: str | None = None, limit: int = 50, guardian_ctx=Depends(require_guardian)):
+def get_decisions(child_id: str | None = None, limit: int = 50, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     logger.info("decisions_requested", child_id=child_id, limit=limit)
     return {"decisions": db.get_recent_decisions(child_id, limit, household_id)}
@@ -250,7 +251,7 @@ async def stream_device_decisions(device_ctx=Depends(require_device_stream)):
     )
 
 @app.get("/v1/settings/security")
-async def get_security_settings(guardian_ctx=Depends(require_guardian)):
+def get_security_settings(guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     return {"parent_pin_set": db.is_parent_pin_set(household_id), "pin_policy": PIN_POLICY}
 
@@ -299,14 +300,14 @@ async def patch_control(body: ControlPatchPayload, guardian_ctx=Depends(require_
     return {"ok": True, "paused_until": until_ms}
 
 @app.get("/v1/children")
-async def list_children(guardian_ctx=Depends(require_guardian)):
+def list_children(guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     children = db.fetch_children(household_id)
     logger.info("children_requested", count=len(children))
     return {"children": children, "active_child_id": db.get_active_child_id(household_id)}
 
 @app.get("/v1/children/{child_id}/devices")
-async def list_child_devices(child_id: str, guardian_ctx=Depends(require_guardian)):
+def list_child_devices(child_id: str, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     if not db.get_child_profile(child_id, household_id):
         raise HTTPException(404, "child not found")

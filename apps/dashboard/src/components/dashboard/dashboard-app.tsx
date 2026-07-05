@@ -25,8 +25,9 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { apiFetch, ApiError, decisionStreamUrl } from "@/lib/api-client";
-import { clientLogger, downloadClientLogFile } from "@/lib/client-logger";
+import { apiFetch, ApiError } from "@/lib/api-client";
+import { downloadClientLogFile } from "@/lib/client-logger";
+import { useDashboardData } from "@/lib/dashboard-data";
 import {
   attentionItems,
   categoryBreakdown,
@@ -84,17 +85,28 @@ type PinFormState = {
 type IconComponent = React.ComponentType<{ className?: string }>;
 
 export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
-  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const {
+    isLoaded,
+    isSignedIn,
+    token,
+    children,
+    activeChildId,
+    selectedChild,
+    setSelectedChild,
+    security,
+    setSecurity,
+    decisions,
+    setDecisions,
+    events,
+    coreLoading,
+    activityLoading,
+    error,
+    refreshCore,
+    ensureActivity,
+  } = useDashboardData();
   const { user } = useUser();
-  const [children, setChildren] = useState<ChildProfile[]>([]);
-  const [selectedChild, setSelectedChild] = useState<string | null>(null);
-  const [activeChildId, setActiveChildId] = useState<string | null>(null);
-  const [events, setEvents] = useState<EventRecord[]>([]);
-  const [decisions, setDecisions] = useState<DecisionRecord[]>([]);
-  const [security, setSecurity] = useState<SecuritySettings | null>(null);
   const [timeRange, setTimeRange] = useState<TimeRange>("today");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState<Record<string, boolean>>({});
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [monitoringSession, setMonitoringSession] = useState<any>(null);
@@ -111,54 +123,8 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
   const [isPausedManual, setIsPausedManual] = useState(false);
   const [pausedUntilMs, setPausedUntilMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const [authToken, setAuthToken] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
-
-  const token = useCallback(() => getToken(), [getToken]);
-
-  const refreshAll = useCallback(async () => {
-    if (!isSignedIn) return;
-    setError(null);
-    setLoading(true);
-    try {
-      const authToken = await token();
-      setAuthToken(authToken);
-      const [childrenResp, decisionsResp, eventsResp, securityResp] = await Promise.all([
-        apiFetch<{ children: ChildProfile[]; active_child_id: string | null }>("/v1/children", authToken),
-        apiFetch<{ decisions: DecisionRecord[] }>("/v1/decisions?limit=200", authToken),
-        apiFetch<{ events: EventRecord[] }>("/v1/events?limit=200", authToken),
-        apiFetch<SecuritySettings>("/v1/settings/security", authToken),
-      ]);
-      const childList = childrenResp.children || [];
-      setChildren(childList);
-      setActiveChildId(childrenResp.active_child_id || null);
-      setSelectedChild((previous) => {
-        if (!childList.length) return null;
-        if (childrenResp.active_child_id && childList.some((child) => child.id === childrenResp.active_child_id)) {
-          return childrenResp.active_child_id;
-        }
-        if (previous && childList.some((child) => child.id === previous)) return previous;
-        return childList[0].id;
-      });
-      setDecisions((decisionsResp.decisions || []).map(normalizeDecision));
-      setEvents(eventsResp.events || []);
-      setSecurity(securityResp);
-      clientLogger.info("dashboard data loaded", {
-        children: childList.length,
-        decisions: decisionsResp.decisions?.length || 0,
-        events: eventsResp.events?.length || 0,
-        parent_pin_set: securityResp.parent_pin_set,
-      });
-    } catch (err) {
-      setError("Could not load dashboard data. Check the API service and try again.");
-      clientLogger.error("failed to load dashboard data", { error: String(err) });
-    } finally {
-      setLoading(false);
-    }
-  }, [isSignedIn, token]);
 
   useEffect(() => {
-    clientLogger.info("dashboard loaded");
     const stored = localStorage.getItem("paused_until");
     if (stored) {
       const val = parseInt(stored, 10);
@@ -169,56 +135,11 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
     }
   }, []);
 
+  // Only the dashboard view renders decisions/events, so fetch them lazily —
+  // /profile and /settings never pay for the activity payload.
   useEffect(() => {
-    if (!isSignedIn) {
-      setChildren([]);
-      setEvents([]);
-      setDecisions([]);
-      setSelectedChild(null);
-      setSecurity(null);
-      setAuthToken(null);
-      if (esRef.current) {
-        esRef.current.close();
-        esRef.current = null;
-      }
-      return;
-    }
-    refreshAll();
-  }, [isSignedIn, refreshAll]);
-
-  useEffect(() => {
-    if (!isSignedIn) return;
-    let cancelled = false;
-    let es: EventSource | null = null;
-    token()
-      .then((authToken) => {
-        if (cancelled) return;
-        es = new EventSource(decisionStreamUrl(authToken));
-        es.onmessage = (event) => {
-          try {
-            const msg = normalizeDecision(JSON.parse(event.data));
-            setDecisions((previous) => {
-              const index = previous.findIndex((decision) => decision.id === msg.id);
-              if (index >= 0) {
-                const clone = [...previous];
-                clone[index] = { ...clone[index], ...msg };
-                return clone;
-              }
-              return [msg, ...previous].slice(0, 200);
-            });
-          } catch (err) {
-            clientLogger.error("failed to parse decision stream message", { error: String(err) });
-          }
-        };
-        es.onerror = () => clientLogger.warn("decision stream error");
-        esRef.current = es;
-      })
-      .catch((err) => clientLogger.error("failed to open decision stream", { error: String(err) }));
-    return () => {
-      cancelled = true;
-      if (es) es.close();
-    };
-  }, [isSignedIn, token]);
+    if (initialView === "dashboard") ensureActivity();
+  }, [initialView, ensureActivity]);
 
   useEffect(() => {
     const id = setInterval(() => setNowMs(Date.now()), 1000);
@@ -263,7 +184,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
       body: JSON.stringify({ child_id: childId, name: form.name.trim(), strictness: form.strictness, age: form.age }),
     });
     setChildDialogOpen(false);
-    await refreshAll();
+    await refreshCore();
     setSelectedChild(childId);
   };
 
@@ -275,7 +196,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
       body: JSON.stringify({ name: form.name.trim(), strictness: form.strictness, age: form.age }),
     });
     setChildDialogOpen(false);
-    await refreshAll();
+    await refreshCore();
   };
 
   const submitPin = async () => {
@@ -303,7 +224,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
       setPinForm({ currentPin: "", newPin: "", confirmPin: "" });
       setPinDialogOpen(false);
       setSecurity((previous) => previous ? { ...previous, parent_pin_set: true } : previous);
-      await refreshAll();
+      await refreshCore();
     } catch (err) {
       const apiError = err as ApiError;
       setPinMessage(apiError.detail === "current_pin_required" ? "Enter your current PIN first." : apiError.message);
@@ -333,7 +254,7 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
         setPinDialogOpen(true);
         return;
       }
-      setError(apiError.message || "Could not pause monitoring.");
+      setActionError(apiError.message || "Could not pause monitoring.");
     }
   };
 
@@ -424,6 +345,15 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
   if (!isLoaded) return <DashboardSkeleton />;
   if (!isSignedIn) return <SignedOut />;
 
+  // Gate each view only on the data it actually renders: Profile needs none,
+  // the dashboard needs children + activity, the rest just need children.
+  const dataLoading =
+    initialView === "profile"
+      ? false
+      : initialView === "dashboard"
+        ? coreLoading || activityLoading
+        : coreLoading;
+
   return (
     <div className="min-h-screen bg-background text-foreground">
       <AppShell activeView={initialView} userName={user?.fullName || user?.primaryEmailAddress?.emailAddress || "Guardian"}>
@@ -441,20 +371,20 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
             }}
           />
 
-          {error && (
+          {(error || actionError) && (
             <Alert variant="destructive">
               <AlertCircle className="size-4" />
               <AlertTitle>Dashboard needs attention</AlertTitle>
               <AlertDescription className="flex flex-wrap items-center justify-between gap-3">
-                <span>{error}</span>
-                <Button variant="outline" size="sm" onClick={refreshAll}>
+                <span>{error || actionError}</span>
+                <Button variant="outline" size="sm" onClick={refreshCore}>
                   <RefreshCw className="size-4" /> Retry
                 </Button>
               </AlertDescription>
             </Alert>
           )}
 
-          {loading ? (
+          {dataLoading ? (
             <DashboardSkeleton />
           ) : initialView === "settings" ? (
             <SettingsView
