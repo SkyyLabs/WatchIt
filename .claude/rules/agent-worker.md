@@ -7,7 +7,9 @@ Applies when touching `services/agent-worker/src/watchit_agents/` or `services/l
 `runtime.py` orchestrates event processing:
 pause check → profile load → URL decision-cache lookup → LangGraph (`graph.py`) → analysis + decision writes → SSE publish. Emits per-step timing logs (queue wait, each stage, total).
 
-`graph.py` wires the LangGraph steps in `agents/`: `url_agent`, `headlines_agent`, `ocr_agent`, `planner_agent`, `policy_agent`. `llm_judge.py` and `safety.py` back the classification/judging steps.
+`graph.py` wires the LangGraph steps in `agents/`: `headlines_agent`, `url_agent`, `ocr_agent`, `policy_agent`. `llm_judge.py` and `safety.py` back the classification/judging steps.
+
+**Routing is deterministic conditional edges — no LLM planner.** Flow: `headline` (cheap: tokens/domain/keyword scores) → confident allow (allowlist) or block short-circuits to `policy`; otherwise → `url_llm` (LLM judge). From `url_llm`: a clearly-harmful judgment (block/high severity) goes straight to `policy`; an ambiguous one escalates to `ocr` only when `WATCHIT_ENABLE_OCR` is set. `ocr` with no screenshots requests an upgrade (runtime emits interim `pending_ocr` = warn, never allow) and re-runs via `POST /v1/event/upgrade`. **False-negative invariants:** never allow on an uncertain cheap signal; `judge_json` is always populated before `policy` (so its default-allow branch is unreachable for real pages); the OCR-pending interim is `warn`, not `allow`.
 
 ## Queue
 
