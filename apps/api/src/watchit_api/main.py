@@ -28,6 +28,12 @@ from watchit_core.url_cache import url_cache_key
 
 from watchit_core.activity_logger import log_service_event, log_service_shutdown
 
+# Importing watchit_agents.worker above ran its module-level
+# configure_logging("agent-worker"), which (logging already configured) only
+# rebinds the structlog service context. Restore "api" so API startup/shutdown
+# and other non-request records aren't misclassified as the worker in the drain.
+bind_log_context(service="api")
+
 app = FastAPI(title="WatchIt Local API", version="0.2.0", description="Local-only parental monitoring with Docling OCR and predictive blocking")
 _learning_loop: GuardianLearningLoop | None = None
 _learning_task: asyncio.Task | None = None
