@@ -338,94 +338,6 @@ class Database:
             )
             return cur.fetchall()
 
-    # --- Quiet-hours schedules -------------------------------------------------
-    # quiet_start/quiet_end are TIME columns; read them back as "HH:MM" strings so
-    # the API and the worker policy gate don't juggle datetime.time objects.
-    _SCHEDULE_COLUMNS = (
-        "id, household_id, child_id, device_id, name, days, "
-        "to_char(quiet_start, 'HH24:MI') AS quiet_start, "
-        "to_char(quiet_end, 'HH24:MI') AS quiet_end, timezone, enabled"
-    )
-
-    def list_schedules(self, household_id: str, child_id: str) -> List[Dict[str, Any]]:
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                f"SELECT {self._SCHEDULE_COLUMNS} FROM child_schedules "
-                "WHERE household_id=%s AND child_id=%s "
-                "ORDER BY device_id NULLS FIRST, created_at ASC",
-                (household_id, child_id),
-            )
-            return cur.fetchall()
-
-    def upsert_schedule(
-        self,
-        household_id: str,
-        child_id: str,
-        days: str,
-        quiet_start: str,
-        quiet_end: str,
-        *,
-        device_id: Optional[str] = None,
-        name: str = "Quiet hours",
-        enabled: bool = True,
-        timezone: Optional[str] = None,
-        schedule_id: Optional[str] = None,
-    ) -> str:
-        with self._connect() as conn, conn.cursor() as cur:
-            if schedule_id:
-                cur.execute(
-                    """
-                    UPDATE child_schedules
-                    SET device_id=%s, name=%s, days=%s, quiet_start=%s, quiet_end=%s,
-                        timezone=%s, enabled=%s, updated_at=now()
-                    WHERE id=%s AND household_id=%s
-                    RETURNING id
-                    """,
-                    (device_id, name, days, quiet_start, quiet_end, timezone, enabled, schedule_id, household_id),
-                )
-                row = cur.fetchone()
-                if row:
-                    return row["id"]
-            new_id = self._new_id("sch")
-            cur.execute(
-                """
-                INSERT INTO child_schedules(id, household_id, child_id, device_id, name, days, quiet_start, quiet_end, timezone, enabled)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (new_id, household_id, child_id, device_id, name, days, quiet_start, quiet_end, timezone, enabled),
-            )
-            return cur.fetchone()["id"]
-
-    def delete_schedule(self, schedule_id: str, household_id: str) -> int:
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM child_schedules WHERE id=%s AND household_id=%s",
-                (schedule_id, household_id),
-            )
-            return cur.rowcount
-
-    def get_effective_quiet_schedule(
-        self, household_id: str, child_id: str, device_id: Optional[str] = None
-    ) -> Optional[Dict[str, Any]]:
-        # Device-level override wins; otherwise fall back to the child-level default.
-        with self._connect() as conn, conn.cursor() as cur:
-            if device_id:
-                cur.execute(
-                    f"SELECT {self._SCHEDULE_COLUMNS} FROM child_schedules "
-                    "WHERE household_id=%s AND child_id=%s AND device_id=%s AND enabled=TRUE LIMIT 1",
-                    (household_id, child_id, device_id),
-                )
-                row = cur.fetchone()
-                if row:
-                    return row
-            cur.execute(
-                f"SELECT {self._SCHEDULE_COLUMNS} FROM child_schedules "
-                "WHERE household_id=%s AND child_id=%s AND device_id IS NULL AND enabled=TRUE LIMIT 1",
-                (household_id, child_id),
-            )
-            return cur.fetchone()
-
     def fetch_devices(self, household_id: str, child_id: str) -> List[Dict[str, Any]]:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -1064,14 +976,6 @@ class Database:
             pairing = cur.fetchone()
             if not pairing:
                 return None
-            # Same physical device (unique install_id) may already be paired to
-            # another child. Capture the prior owner before the upsert overwrites it
-            # so we can stop its stale session and audit the reassignment.
-            cur.execute(
-                "SELECT id, child_id, household_id FROM devices WHERE install_id=%s",
-                (install_id,),
-            )
-            prior = cur.fetchone()
             cur.execute(
                 """
                 INSERT INTO devices(
@@ -1105,25 +1009,7 @@ class Database:
                 ),
             )
             device = cur.fetchone()
-            reassigned = None
-            if prior and prior["child_id"] != pairing["child_id"]:
-                # Stop the previous child's active session for this exact device
-                # (scoped by device_id so the child's other devices keep running).
-                cur.execute(
-                    """
-                    UPDATE monitoring_sessions
-                    SET status='stopped', stopped_at=now(), stop_reason='device_reassigned'
-                    WHERE child_id=%s AND device_id=%s AND status='active'
-                    """,
-                    (prior["child_id"], prior["id"]),
-                )
-                reassigned = {
-                    "from_child_id": prior["child_id"],
-                    "from_household_id": prior["household_id"],
-                    "to_child_id": pairing["child_id"],
-                    "to_household_id": pairing["household_id"],
-                }
-        return {"device": device, "device_token": device_token, "reassigned": reassigned}
+        return {"device": device, "device_token": device_token}
 
     def authenticate_device_token(self, token: str) -> Optional[Dict[str, Any]]:
         token_hash = self._token_hash(token)

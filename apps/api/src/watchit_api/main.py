@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio
-import re
 import time
 import uuid
 from fastapi import Depends, FastAPI, HTTPException
@@ -189,15 +188,6 @@ class ChildMovePayload(BaseModel):
 
 class MonitoringTogglePayload(BaseModel):
     enabled: bool
-
-class ScheduleUpsertPayload(BaseModel):
-    schedule_id: Optional[str] = None
-    device_id: Optional[str] = None
-    name: Optional[str] = None
-    days: str
-    quiet_start: str
-    quiet_end: str
-    enabled: bool = True
 
 @app.post("/v1/event")
 async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
@@ -426,52 +416,6 @@ def list_guardian_children(guardian_ctx=Depends(require_guardian)):
     guardian_id = guardian_ctx["guardian"]["id"]
     return {"children": db.fetch_guardian_children(guardian_id)}
 
-_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
-_VALID_DAYS = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
-
-@app.get("/v1/children/{child_id}/schedules")
-def list_child_schedules(child_id: str, guardian_ctx=Depends(require_guardian)):
-    household_id = guardian_ctx["household"]["id"]
-    if not db.get_child_profile(child_id, household_id):
-        raise HTTPException(404, "child not found")
-    return {"schedules": db.list_schedules(household_id, child_id)}
-
-@app.post("/v1/children/{child_id}/schedules")
-async def upsert_child_schedule(child_id: str, payload: ScheduleUpsertPayload, guardian_ctx=Depends(require_guardian)):
-    household_id = guardian_ctx["household"]["id"]
-    guardian_id = guardian_ctx["guardian"]["id"]
-    if not db.get_child_profile(child_id, household_id):
-        raise HTTPException(404, "child not found")
-    if not _TIME_RE.match(payload.quiet_start) or not _TIME_RE.match(payload.quiet_end):
-        raise HTTPException(400, "quiet_start/quiet_end must be HH:MM")
-    days = [d.strip() for d in payload.days.split(",") if d.strip()]
-    if not days or any(d not in _VALID_DAYS for d in days):
-        raise HTTPException(400, "days must be a comma list of Mon..Sun")
-    if payload.device_id and not any(d["id"] == payload.device_id for d in db.fetch_devices(household_id, child_id)):
-        raise HTTPException(404, "device not found")
-    schedule_id = db.upsert_schedule(
-        household_id,
-        child_id,
-        ",".join(days),
-        payload.quiet_start,
-        payload.quiet_end,
-        device_id=payload.device_id,
-        name=payload.name or "Quiet hours",
-        enabled=payload.enabled,
-        schedule_id=payload.schedule_id,
-    )
-    db.log_audit(household_id, "schedule_saved", guardian_id=guardian_id, entity_type="child_schedule", entity_id=schedule_id)
-    return {"schedule_id": schedule_id}
-
-@app.delete("/v1/schedules/{schedule_id}")
-async def delete_child_schedule(schedule_id: str, guardian_ctx=Depends(require_guardian)):
-    household_id = guardian_ctx["household"]["id"]
-    guardian_id = guardian_ctx["guardian"]["id"]
-    if db.delete_schedule(schedule_id, household_id) == 0:
-        raise HTTPException(404, "schedule not found")
-    db.log_audit(household_id, "schedule_deleted", guardian_id=guardian_id, entity_type="child_schedule", entity_id=schedule_id)
-    return {"ok": True}
-
 @app.get("/v1/children")
 def list_children(guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
@@ -597,14 +541,6 @@ async def redeem_pairing_code(payload: PairingRedeemPayload):
         raise HTTPException(400, "invalid or expired pairing code")
     device = result["device"]
     db.log_audit(device["household_id"], "device_paired", device_id=device["id"], entity_type="device", entity_id=device["id"])
-    reassigned = result.get("reassigned")
-    if reassigned:
-        # Same install_id was stolen from another child: record it on both sides
-        # so the previous owner's guardian has a trail of where the device went.
-        db.log_audit(reassigned["from_household_id"], "device_reassigned", device_id=device["id"], entity_type="device", entity_id=device["id"], metadata=reassigned)
-        if reassigned["to_household_id"] != reassigned["from_household_id"]:
-            db.log_audit(reassigned["to_household_id"], "device_reassigned", device_id=device["id"], entity_type="device", entity_id=device["id"], metadata=reassigned)
-        logger.info("device_reassigned", device_id=device["id"], from_child_id=reassigned["from_child_id"], to_child_id=reassigned["to_child_id"])
     return {"device": device, "device_token": result["device_token"]}
 
 @app.patch("/v1/devices/{device_id}")
