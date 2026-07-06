@@ -14,6 +14,7 @@ import {
   Eye,
   KeyRound,
   Lock,
+  Menu,
   MonitorCheck,
   Plus,
   RefreshCw,
@@ -56,6 +57,7 @@ import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
+import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
@@ -358,18 +360,20 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
     <div className="min-h-screen bg-background text-foreground">
       <AppShell activeView={initialView} userName={user?.fullName || user?.primaryEmailAddress?.emailAddress || "Guardian"}>
         <div className="space-y-6">
-          <Header
-            userName={user?.firstName || user?.fullName || "Guardian"}
-            children={children}
-            selectedChild={selectedChild}
-            setSelectedChild={setSelectedChild}
-            timeRange={timeRange}
-            setTimeRange={setTimeRange}
-            onAddChild={() => {
-              setChildDialogMode("create");
-              setChildDialogOpen(true);
-            }}
-          />
+          {initialView === "dashboard" && (
+            <Header
+              userName={user?.firstName || user?.fullName || "Guardian"}
+              children={children}
+              selectedChild={selectedChild}
+              setSelectedChild={setSelectedChild}
+              timeRange={timeRange}
+              setTimeRange={setTimeRange}
+              onAddChild={() => {
+                setChildDialogMode("create");
+                setChildDialogOpen(true);
+              }}
+            />
+          )}
 
           {(error || actionError) && (
             <Alert variant="destructive">
@@ -499,55 +503,106 @@ function SignedOut() {
   );
 }
 
-function AppShell({ activeView, userName, children }: { activeView: DashboardRouteView; userName: string; children: React.ReactNode }) {
-  const nav = [
-    { view: "dashboard", href: "/", label: "Dashboard", icon: CircleGauge },
-    { view: "settings", href: "/settings", label: "Settings", icon: Settings },
-    { view: "profile", href: "/profile", label: "Profile", icon: UserRound },
-    { view: "children", href: "/children", label: "Children", icon: Users },
-  ] as const;
+const NAV_ITEMS = [
+  { view: "dashboard", href: "/", label: "Dashboard", icon: CircleGauge },
+  { view: "children", href: "/children", label: "Children", icon: Users },
+  { view: "settings", href: "/settings", label: "Settings", icon: Settings },
+  { view: "profile", href: "/profile", label: "Profile", icon: UserRound },
+] as const;
+
+function Brand() {
   return (
-    <div className="mx-auto grid min-h-screen w-full max-w-7xl grid-cols-1 gap-0 lg:grid-cols-[240px_1fr]">
-      <aside className="border-b border-border bg-card/60 p-4 lg:border-b-0 lg:border-r">
-        <div className="flex items-center gap-3">
-          <div className="flex size-9 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <Shield className="size-4" />
-          </div>
-          <div>
-            <p className="text-sm font-semibold">WatchIt</p>
-            <p className="text-xs text-muted-foreground">Parent console</p>
-          </div>
+    <div className="flex items-center gap-3">
+      <div className="flex size-9 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm">
+        <Shield className="size-4" />
+      </div>
+      <div className="leading-tight">
+        <p className="text-sm font-semibold tracking-tight">WatchIt</p>
+        <p className="text-xs text-muted-foreground">Parent console</p>
+      </div>
+    </div>
+  );
+}
+
+function SidebarNav({ activeView, onNavigate }: { activeView: DashboardRouteView; onNavigate?: () => void }) {
+  return (
+    <nav className="flex flex-col gap-1 p-3">
+      {NAV_ITEMS.map((item) => {
+        const Icon = item.icon;
+        const active = activeView === item.view;
+        return (
+          <Link
+            key={item.view}
+            href={item.href}
+            onClick={onNavigate}
+            className={cn(
+              "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+              active
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
+            )}
+          >
+            <Icon className="size-4" /> {item.label}
+          </Link>
+        );
+      })}
+    </nav>
+  );
+}
+
+function AppShell({ activeView, userName, children }: { activeView: DashboardRouteView; userName: string; children: React.ReactNode }) {
+  const [navOpen, setNavOpen] = useState(false);
+  return (
+    <div className="flex min-h-screen w-full flex-col lg:flex-row">
+      <aside className="hidden w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar lg:flex">
+        <div className="border-b border-sidebar-border p-4">
+          <Brand />
         </div>
-        <nav className="mt-6 flex gap-2 lg:flex-col">
-          {nav.map((item) => {
-            const Icon = item.icon;
-            return (
-              <Button key={item.view} asChild variant={activeView === item.view ? "secondary" : "ghost"} className="justify-start">
-                <Link href={item.href}>
-                  <Icon className="size-4" /> {item.label}
-                </Link>
-              </Button>
-            );
-          })}
-        </nav>
+        <SidebarNav activeView={activeView} />
       </aside>
-      <main className="min-w-0 p-4 sm:p-6 lg:p-8">
-        <div className="mb-6 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <Avatar>
-              <AvatarFallback>{userName.slice(0, 2).toUpperCase()}</AvatarFallback>
-            </Avatar>
-            <div>
-              <p className="text-sm font-medium">{userName}</p>
-              <p className="text-xs text-muted-foreground">Signed in guardian</p>
-            </div>
-          </div>
-          <SignOutButton>
-            <Button variant="outline" size="sm">Sign out</Button>
-          </SignOutButton>
+
+      <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-border bg-sidebar/95 px-4 py-3 backdrop-blur supports-backdrop-filter:bg-sidebar/80 lg:hidden">
+        <div className="flex items-center gap-2">
+          <Sheet open={navOpen} onOpenChange={setNavOpen}>
+            <SheetTrigger asChild>
+              <Button variant="ghost" size="icon-sm" aria-label="Open navigation">
+                <Menu className="size-5" />
+              </Button>
+            </SheetTrigger>
+            <SheetContent side="left" className="w-72 bg-sidebar p-0" showCloseButton={false}>
+              <SheetTitle className="sr-only">Navigation</SheetTitle>
+              <div className="border-b border-sidebar-border p-4">
+                <Brand />
+              </div>
+              <SidebarNav activeView={activeView} onNavigate={() => setNavOpen(false)} />
+            </SheetContent>
+          </Sheet>
+          <Brand />
         </div>
-        {children}
-      </main>
+        <SignOutButton>
+          <Button variant="outline" size="sm">Sign out</Button>
+        </SignOutButton>
+      </header>
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <main className="min-w-0 flex-1 p-4 sm:p-6 lg:p-8">
+          <div className="mb-6 hidden items-center justify-between gap-4 lg:flex">
+            <div className="flex items-center gap-3">
+              <Avatar>
+                <AvatarFallback>{userName.slice(0, 2).toUpperCase()}</AvatarFallback>
+              </Avatar>
+              <div>
+                <p className="text-sm font-medium">{userName}</p>
+                <p className="text-xs text-muted-foreground">Signed in guardian</p>
+              </div>
+            </div>
+            <SignOutButton>
+              <Button variant="outline" size="sm">Sign out</Button>
+            </SignOutButton>
+          </div>
+          {children}
+        </main>
+      </div>
     </div>
   );
 }
@@ -693,7 +748,7 @@ function OnboardingPanel(props: {
         {steps.map((step) => (
           <div key={step.label} className="flex items-center justify-between rounded-lg border p-4">
             <div className="flex items-center gap-3">
-              <div className={cn("flex size-8 items-center justify-center rounded-full", step.complete ? "bg-emerald-500/15 text-emerald-400" : "bg-muted text-muted-foreground")}>
+              <div className={cn("flex size-8 items-center justify-center rounded-full", step.complete ? "bg-success/15 text-success" : "bg-muted text-muted-foreground")}>
                 {step.complete ? <Check className="size-4" /> : <ChevronRight className="size-4" />}
               </div>
               <span className="font-medium">{step.label}</span>
@@ -763,7 +818,7 @@ function AttentionNeeded(props: {
           <div key={item.id} className="rounded-lg border p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0">
-                <Badge className={riskClass(item.riskLevel)}>{item.riskLevel} risk</Badge>
+                <Badge variant={riskVariant(item.riskLevel)}>{item.riskLevel} risk</Badge>
                 <h3 className="mt-2 truncate font-medium">{item.title || domainFromUrl(item.url)}</h3>
                 <p className="mt-1 text-sm text-muted-foreground">{displayReason(item.reason)}</p>
                 <p className="mt-1 text-xs text-muted-foreground">{formatDateTime(item.ts)} · {domainFromUrl(item.url)}</p>
@@ -1130,10 +1185,10 @@ function DashboardSkeleton() {
   );
 }
 
-function riskClass(level: string) {
-  if (level === "high") return "bg-red-500/15 text-red-300 hover:bg-red-500/20";
-  if (level === "medium") return "bg-amber-500/15 text-amber-300 hover:bg-amber-500/20";
-  return "bg-blue-500/15 text-blue-300 hover:bg-blue-500/20";
+function riskVariant(level: string): "destructive" | "warning" | "info" {
+  if (level === "high") return "destructive";
+  if (level === "medium") return "warning";
+  return "info";
 }
 
 function clampAge(value: string) {
