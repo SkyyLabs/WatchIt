@@ -4,7 +4,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import { useAuth } from "@clerk/nextjs";
 
 import { apiFetch, decisionStreamUrl } from "@/lib/api-client";
-import { clientLogger } from "@/lib/client-logger";
+import { clientLogger, startClientLogShipping } from "@/lib/client-logger";
 import {
   ChildProfile,
   DecisionRecord,
@@ -119,6 +119,12 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     activityRequested.current = true;
     void refreshActivity();
   }, [refreshActivity]);
+
+  // Ship buffered client logs to the backend (for the log drain) once signed in.
+  useEffect(() => {
+    if (!isSignedIn) return;
+    return startClientLogShipping(token);
+  }, [isSignedIn, token]);
 
   useEffect(() => {
     if (!isSignedIn) {

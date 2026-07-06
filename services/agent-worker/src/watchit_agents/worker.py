@@ -7,7 +7,7 @@ import time
 from watchit_core.config import settings
 from watchit_core.db import db
 from watchit_core.activity_logger import log_service_event
-from watchit_core.logging import bind_log_context, clear_log_context, configure_logging, get_logger
+from watchit_core.logging import bind_log_context, clear_log_context, configure_logging, get_logger, shutdown_logging
 from watchit_agents.runtime import process_event
 
 configure_logging("agent-worker")
@@ -41,7 +41,7 @@ class AgentWorker:
         jobs = db.claim_event_jobs(self.batch_size)
         claim_duration_ms = round((time.perf_counter() - claim_started) * 1000, 2)
         if jobs:
-            logger.info("event_jobs_claimed", count=len(jobs), claim_duration_ms=claim_duration_ms)
+            logger.debug("event_jobs_claimed", count=len(jobs), claim_duration_ms=claim_duration_ms)
         for job in jobs:
             clear_log_context()
             created_at = int(job.get("created_at") or 0)
@@ -59,11 +59,11 @@ class AgentWorker:
                 event_payload = job["event_json"]
                 event = event_payload if isinstance(event_payload, dict) else json.loads(event_payload)
                 bind_log_context(child_id=event.get("child_id"), tab_id=event.get("tab_id"))
-                logger.info("event_job_started", attempts=job.get("attempts"), queue_wait_ms=queue_wait_ms)
+                logger.debug("event_job_started", attempts=job.get("attempts"), queue_wait_ms=queue_wait_ms)
                 await process_event(event, upgrade=bool(job.get("upgrade")))
                 db.complete_event_job(job["id"])
                 processing_duration_ms = round((time.perf_counter() - job_started) * 1000, 2)
-                logger.info("event_job_completed", processing_duration_ms=processing_duration_ms, queue_wait_ms=queue_wait_ms)
+                logger.debug("event_job_completed", processing_duration_ms=processing_duration_ms, queue_wait_ms=queue_wait_ms)
             except Exception as exc:
                 processing_duration_ms = round((time.perf_counter() - job_started) * 1000, 2)
                 logger.exception("event_job_failed", processing_duration_ms=processing_duration_ms, queue_wait_ms=queue_wait_ms)
@@ -74,7 +74,11 @@ class AgentWorker:
 
 
 async def main() -> None:
-    await AgentWorker().run_forever()
+    try:
+        await AgentWorker().run_forever()
+    finally:
+        # Drain the async log listener so shutdown records still reach stdout.
+        shutdown_logging()
 
 
 if __name__ == "__main__":

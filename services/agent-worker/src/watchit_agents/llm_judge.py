@@ -129,7 +129,7 @@ class LLMJudge:
         # Send to Ollama
         try:
             llm_started = time.perf_counter()
-            self.logger.info(
+            self.logger.debug(
                 "llm_judge_started",
                 provider=settings.llm_provider,
                 model=self.model,
@@ -185,7 +185,7 @@ class LLMJudge:
         # Validate with Pydantic
         try:
             result = JudgeOut(**data).model_dump()
-            self.logger.info(
+            self.logger.debug(
                 "llm_judge_finished",
                 action=result.get("action"),
                 confidence=result.get("confidence"),

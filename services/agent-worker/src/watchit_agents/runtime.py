@@ -33,6 +33,43 @@ policy = PolicyEngine()
 logger = get_logger("watchit.runtime")
 
 
+def _log_decision(
+    *,
+    url: Optional[str],
+    action: str,
+    decided_by: str,
+    detail: Optional[str],
+    rationale: Optional[str],
+    household_id: Optional[str],
+    child_id: Optional[str],
+    age: Any = None,
+    needs_ocr: bool,
+    confidence: float,
+    decision_id: str,
+) -> None:
+    """The one high-signal INFO line per decision (url, action, why, who).
+
+    `decided_by` is the coarse reason: cache | llm | url | ocr | paused.
+    `rationale` is only carried when an LLM produced one (blocked/allowed/blurred).
+    Everything else in the pipeline logs at DEBUG to keep this line readable.
+    """
+    payload: Dict[str, Any] = {
+        "url": url,
+        "action": action,
+        "reason": decided_by,
+        "detail": detail,
+        "household": household_id,
+        "child": child_id,
+        "age": age,
+        "needs_ocr": needs_ocr,
+        "confidence": confidence,
+        "decision_id": decision_id,
+    }
+    if rationale:
+        payload["rationale"] = rationale
+    logger.info("decision", **payload)
+
+
 def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000, 2)
 
@@ -167,7 +204,7 @@ def _decision_message_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
 async def publish_decision_row(row: Dict[str, Any]) -> None:
     message = _decision_message_from_row(row)
     await bus.publish(message)
-    logger.info("decision_published", decision_id=message.get("decision_id"), event_id=message.get("event_id"), action=message.get("action"))
+    logger.debug("decision_published", decision_id=message.get("decision_id"), event_id=message.get("event_id"), action=message.get("action"))
 
 async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict[str, Any]:
     pipeline_started = time.perf_counter()
@@ -186,7 +223,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
         db.add_event(event)
     db_event_write_ms = _elapsed_ms(db_started)
     bind_log_context(event_id=event_id, household_id=household_id, child_id=event.get("child_id"), tab_id=event.get("tab_id"), upgrade=upgrade)
-    logger.info("event_processing_started", url=event.get("url"), db_event_write_ms=db_event_write_ms)
+    logger.debug("event_processing_started", url=event.get("url"), db_event_write_ms=db_event_write_ms)
 
     # Global + per-device pause gate: short-circuit the pipeline while paused.
     pause_started = time.perf_counter()
@@ -198,7 +235,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
             "pipeline_bypassed_paused",
             {"event_id": event_id, "child_id": event.get("child_id"), "paused_until_ms": paused_until},
         )
-        logger.info("pipeline_bypassed_paused", paused_until_ms=paused_until, pause_check_ms=pause_check_ms)
+        logger.debug("pipeline_bypassed_paused", paused_until_ms=paused_until, pause_check_ms=pause_check_ms)
         log_step("event_received", event, {"upgrade": upgrade, "paused": True})
         decision = {"action": "allow", "reason": "paused", "categories": []}
         confidence = 1.0
@@ -226,17 +263,20 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
         await bus.publish(message)
         publish_ms = _elapsed_ms(publish_started)
         pipeline_duration_ms = _elapsed_ms(pipeline_started)
-        logger.info(
-            "decision_created",
-            decision_id=decision_id,
+        _log_decision(
+            url=event.get("url"),
             action=decision["action"],
-            reason=decision["reason"],
-            confidence=confidence,
+            decided_by="paused",
+            detail=decision["reason"],
+            rationale=None,
+            household_id=household_id,
+            child_id=event.get("child_id"),
             needs_ocr=False,
-            decision_write_ms=decision_write_ms,
+            confidence=confidence,
+            decision_id=decision_id,
         )
-        logger.info("decision_published", decision_id=decision_id, action=decision["action"], publish_ms=publish_ms)
-        logger.info("pipeline_timing", cache_hit=False, paused=True, pipeline_duration_ms=pipeline_duration_ms, db_event_write_ms=db_event_write_ms, pause_check_ms=pause_check_ms, decision_write_ms=decision_write_ms, publish_ms=publish_ms)
+        logger.debug("decision_published", decision_id=decision_id, action=decision["action"], publish_ms=publish_ms)
+        logger.debug("pipeline_timing", cache_hit=False, paused=True, pipeline_duration_ms=pipeline_duration_ms, db_event_write_ms=db_event_write_ms, pause_check_ms=pause_check_ms, decision_write_ms=decision_write_ms, publish_ms=publish_ms)
         return message
 
     profile_started = time.perf_counter()
@@ -302,6 +342,21 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
                 cached_details,
             )
             decision_write_ms = _elapsed_ms(decision_write_started)
+            # Same high-signal line as the non-cache path; rationale carried when
+            # the cached decision originally came from the LLM.
+            _log_decision(
+                url=event.get("url"),
+                action=decision["action"],
+                decided_by="cache",
+                detail=decision["reason"],
+                rationale=details.get("rationale"),
+                household_id=household_id,
+                child_id=event.get("child_id"),
+                age=profile.get("age"),
+                needs_ocr=False,
+                confidence=confidence,
+                decision_id=decision_id,
+            )
             message = _format_decision_message(
                 decision_id,
                 event,
@@ -315,7 +370,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
             await bus.publish(message)
             publish_ms = _elapsed_ms(publish_started)
             pipeline_duration_ms = _elapsed_ms(pipeline_started)
-            logger.info(
+            logger.debug(
                 "url_decision_cache_hit",
                 cache_key=cache_key,
                 normalized_url=normalized_url,
@@ -323,7 +378,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
                 action=decision["action"],
                 cache_lookup_ms=cache_lookup_ms,
             )
-            logger.info(
+            logger.debug(
                 "pipeline_timing",
                 cache_hit=True,
                 paused=False,
@@ -336,16 +391,16 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
                 publish_ms=publish_ms,
             )
             return message
-        logger.info("url_decision_cache_miss", cache_key=cache_key, normalized_url=normalized_url, cache_lookup_ms=cache_lookup_ms)
+        logger.debug("url_decision_cache_miss", cache_key=cache_key, normalized_url=normalized_url, cache_lookup_ms=cache_lookup_ms)
     else:
         cache_lookup_ms = 0.0
 
     state = MonitorState(event=event, child_profile=profile, is_upgrade=upgrade)
     graph_started = time.perf_counter()
-    logger.info("agent_graph_started", strictness=profile.get("strictness"), age=profile.get("age"))
+    logger.debug("agent_graph_started", strictness=profile.get("strictness"), age=profile.get("age"))
     state = MonitorState(**app_graph.invoke(state))
     graph_duration_ms = _elapsed_ms(graph_started)
-    logger.info(
+    logger.debug(
         "agent_graph_finished",
         needs_ocr=state.needs_screenshot,
         has_judge=bool(state.judge_json),
@@ -364,7 +419,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
     confidence = state.judge_json.get("confidence", 1.0) if state.judge_json else 1.0
     need_screenshot = settings.enable_ocr and not upgrade and state.needs_screenshot
     if need_screenshot:
-        logger.info("ocr_requested", confidence=confidence, threshold=settings.ocr_confidence_threshold)
+        logger.debug("ocr_requested", confidence=confidence, threshold=settings.ocr_confidence_threshold)
 
     policy_started = time.perf_counter()
     if state.final_decision:
@@ -393,14 +448,24 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
         decision_details,
     )
     decision_write_ms = _elapsed_ms(decision_write_started)
-    logger.info(
-        "decision_created",
-        decision_id=decision_id,
+    if need_screenshot:
+        decided_by = "ocr"
+    elif state.judge_json:
+        decided_by = "llm"
+    else:
+        decided_by = "url"
+    _log_decision(
+        url=event.get("url"),
         action=decision["action"],
-        reason=decision["reason"],
-        confidence=confidence,
+        decided_by=decided_by,
+        detail=decision["reason"],
+        rationale=llm_rationale,
+        household_id=household_id,
+        child_id=event.get("child_id"),
+        age=profile.get("age"),
         needs_ocr=need_screenshot,
-        decision_write_ms=decision_write_ms,
+        confidence=confidence,
+        decision_id=decision_id,
     )
 
     cache_write_ms = 0.0
@@ -428,7 +493,7 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
             household_id=household_id,
         )
         cache_write_ms = _elapsed_ms(cache_write_started)
-        logger.info(
+        logger.debug(
             "url_decision_cache_stored",
             cache_key=cache_key,
             normalized_url=normalized_url,
@@ -453,8 +518,8 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
     await bus.publish(message)
     publish_ms = _elapsed_ms(publish_started)
     pipeline_duration_ms = _elapsed_ms(pipeline_started)
-    logger.info("decision_published", decision_id=decision_id, action=decision["action"], publish_ms=publish_ms)
-    logger.info(
+    logger.debug("decision_published", decision_id=decision_id, action=decision["action"], publish_ms=publish_ms)
+    logger.debug(
         "pipeline_timing",
         cache_hit=False,
         cache_stored=should_cache_decision,
