@@ -541,6 +541,14 @@ async def redeem_pairing_code(payload: PairingRedeemPayload):
         raise HTTPException(400, "invalid or expired pairing code")
     device = result["device"]
     db.log_audit(device["household_id"], "device_paired", device_id=device["id"], entity_type="device", entity_id=device["id"])
+    reassigned = result.get("reassigned")
+    if reassigned:
+        # Same install_id was stolen from another child: record it on both sides
+        # so the previous owner's guardian has a trail of where the device went.
+        db.log_audit(reassigned["from_household_id"], "device_reassigned", device_id=device["id"], entity_type="device", entity_id=device["id"], metadata=reassigned)
+        if reassigned["to_household_id"] != reassigned["from_household_id"]:
+            db.log_audit(reassigned["to_household_id"], "device_reassigned", device_id=device["id"], entity_type="device", entity_id=device["id"], metadata=reassigned)
+        logger.info("device_reassigned", device_id=device["id"], from_child_id=reassigned["from_child_id"], to_child_id=reassigned["to_child_id"])
     return {"device": device, "device_token": result["device_token"]}
 
 @app.patch("/v1/devices/{device_id}")

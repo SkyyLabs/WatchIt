@@ -976,6 +976,14 @@ class Database:
             pairing = cur.fetchone()
             if not pairing:
                 return None
+            # Same physical device (unique install_id) may already be paired to
+            # another child. Capture the prior owner before the upsert overwrites it
+            # so we can stop its stale session and audit the reassignment.
+            cur.execute(
+                "SELECT id, child_id, household_id FROM devices WHERE install_id=%s",
+                (install_id,),
+            )
+            prior = cur.fetchone()
             cur.execute(
                 """
                 INSERT INTO devices(
@@ -1009,7 +1017,25 @@ class Database:
                 ),
             )
             device = cur.fetchone()
-        return {"device": device, "device_token": device_token}
+            reassigned = None
+            if prior and prior["child_id"] != pairing["child_id"]:
+                # Stop the previous child's active session for this exact device
+                # (scoped by device_id so the child's other devices keep running).
+                cur.execute(
+                    """
+                    UPDATE monitoring_sessions
+                    SET status='stopped', stopped_at=now(), stop_reason='device_reassigned'
+                    WHERE child_id=%s AND device_id=%s AND status='active'
+                    """,
+                    (prior["child_id"], prior["id"]),
+                )
+                reassigned = {
+                    "from_child_id": prior["child_id"],
+                    "from_household_id": prior["household_id"],
+                    "to_child_id": pairing["child_id"],
+                    "to_household_id": pairing["household_id"],
+                }
+        return {"device": device, "device_token": device_token, "reassigned": reassigned}
 
     def authenticate_device_token(self, token: str) -> Optional[Dict[str, Any]]:
         token_hash = self._token_hash(token)
