@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Any
+from typing import Any, Dict
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
 
@@ -9,15 +9,16 @@ from watchit_agents.agents import (
     HeadlinesAgent,
     OCRAgent,
     ScreenshotsAgent,
-    PlannerAgent,
     PolicyAgent,
 )
 from watchit_core.config import settings
-from watchit_core.activity_logger import log_agent_step, log_step
+from watchit_core.activity_logger import log_agent_step
 
+# Headline is decisive only at high confidence: clearly unsafe (high-risk
+# tokens/scores) -> block fast, clearly safe (curated allowlist) -> allow.
+# Anything else is uncertain and MUST escalate to the LLM — never allow a page
+# through on a weak cheap signal (false-negative guard).
 HEADLINE_DECISION_THRESHOLD = 0.85
-# Limit planner cycles to reduce latency and avoid loop stalls.
-MAX_LOOPS = 3
 
 
 class MonitorState(BaseModel):
@@ -32,9 +33,6 @@ class MonitorState(BaseModel):
     need_ocr: bool = False
     needs_screenshot: bool = False
     last_tool_run: str = ""
-    next_tool: str = "planner"
-    planner_reason: str = ""
-    loop_count: int = 0
     final_decision: Dict[str, Any] = Field(default_factory=dict)
     has_ocr_run: bool = False
     is_upgrade: bool = False
@@ -44,42 +42,10 @@ headlines_agent = HeadlinesAgent()
 url_agent = URLMetadataAgent()
 ocr_agent = OCRAgent()
 screens_agent = ScreenshotsAgent()
-planner_agent = PlannerAgent()
 policy_agent = PolicyAgent()
 
 
-def node_planner(state: MonitorState) -> MonitorState:
-    # Loop protection
-    state.loop_count += 1
-    if state.loop_count >= MAX_LOOPS:
-        state.next_tool = "policy"
-        state.planner_reason = "max_loops_reached"
-        log_agent_step(
-            "PlannerAgent",
-            "plan_max_loops",
-            state.event,
-            {"loop_count": state.loop_count},
-            {"next_tool": state.next_tool},
-            {"loop_count": state.loop_count},
-            "Loop protection triggered; routing to policy",
-        )
-        return state
-    plan = planner_agent.run(state, state.child_profile)
-    state.next_tool = plan.get("next_tool") or "policy"
-    state.planner_reason = plan.get("reason") or ""
-    log_agent_step(
-        "PlannerAgent",
-        "plan",
-        state.event,
-        {"loop_count": state.loop_count - 1},
-        {"next_tool": state.next_tool, "reason": state.planner_reason},
-        {"loop_count": state.loop_count},
-        f"Planner chose {state.next_tool}",
-    )
-    return state
-
-
-def node_headline_layer(state: MonitorState) -> MonitorState:
+def node_headline(state: MonitorState) -> MonitorState:
     result = headlines_agent.run(state.event, state.child_profile)
     state.last_tool_run = "headline"
     state.fast_scores = result.fast_scores
@@ -89,13 +55,15 @@ def node_headline_layer(state: MonitorState) -> MonitorState:
         "confidence": result.confidence,
         "action": result.action,
     }
-    state.need_llm = True
-    if result.action in ("allow", "block") and result.confidence >= HEADLINE_DECISION_THRESHOLD:
-        state.need_llm = False
+    # Only a high-confidence allow/block short-circuits the LLM.
+    state.need_llm = not (
+        result.action in ("allow", "block") and result.confidence >= HEADLINE_DECISION_THRESHOLD
+    )
+    if not state.need_llm:
         state.judge_json = {
             "action": result.action,
             "categories": result.flags,
-            "severity": "medium" if result.action == "block" else "low",
+            "severity": "high" if result.action == "block" else "low",
             "rationale": "headline_agent_decision",
             "confidence": result.confidence,
             "is_harmful": result.action != "allow",
@@ -107,17 +75,13 @@ def node_headline_layer(state: MonitorState) -> MonitorState:
         state.event,
         {"child_profile": state.child_profile},
         state.headline_result,
-        {"need_llm": state.need_llm, "loop_count": state.loop_count},
+        {"need_llm": state.need_llm},
         "Headline agent evaluated headline/meta",
     )
-    state.next_tool = "planner"
     return state
 
 
-def node_url_layer(state: MonitorState) -> MonitorState:
-    if not state.need_llm:
-        state.next_tool = "planner"
-        return state
+def node_url_llm(state: MonitorState) -> MonitorState:
     result = url_agent.run(
         state.event,
         state.child_profile,
@@ -130,145 +94,131 @@ def node_url_layer(state: MonitorState) -> MonitorState:
     state.confidence = result.confidence
     llm_action = (result.llm_decision or {}).get("action", "").lower()
     llm_severity = (result.llm_decision or {}).get("severity", "").lower()
+    # Clearly-harmful judgments block immediately — don't defer to OCR (avoids a
+    # false-negative window while waiting for a screenshot).
+    clearly_harmful = llm_action == "block" or llm_severity == "high"
     uncertain = (
         result.confidence < settings.ocr_confidence_threshold
         or llm_action in {"warn", "blur", "notify"}
-        or llm_severity in {"medium", "high"}
+        or llm_severity == "medium"
     )
-    state.need_ocr = uncertain
+    state.need_ocr = uncertain and not clearly_harmful
     log_agent_step(
         "URLMetadataAgent",
         "url_layer",
         state.event,
-        {
-            "fast_scores": state.fast_scores,
-            "ocr_text_preview": (state.ocr_text or "")[:120],
-        },
-        {
-            "llm_decision": result.llm_decision,
-            "confidence": result.confidence,
-            "need_ocr": state.need_ocr,
-        },
-        {"loop_count": state.loop_count},
+        {"fast_scores": state.fast_scores, "ocr_text_preview": (state.ocr_text or "")[:120]},
+        {"llm_decision": result.llm_decision, "confidence": result.confidence, "need_ocr": state.need_ocr},
+        {},
         "URL agent evaluated content",
     )
-    state.next_tool = "planner"
     return state
 
 
-def node_ocr_layer(state: MonitorState) -> MonitorState:
+def node_ocr(state: MonitorState) -> MonitorState:
     state.last_tool_run = "ocr"
-    state.needs_screenshot = False
-    # Enforce single OCR run per event
     if state.has_ocr_run:
-        state.next_tool = "planner"
         return state
     state.has_ocr_run = True
 
     screenshots = screens_agent.get_screenshots(state.event)
-    if not screenshots:
-        state.needs_screenshot = True
-        log_agent_step(
-            "OCRAgent",
-            "ocr_request",
+    if screenshots:
+        ocr_text = ocr_agent.extract_text(screenshots)
+        state.ocr_text = ocr_text
+        # Always re-judge (even when OCR text is empty) so judge_json is populated
+        # and policy never falls through to its default-allow branch.
+        refreshed = url_agent.run(
             state.event,
-            {"needs_screenshot": True},
-            {"screenshot_count": 0},
-            {"loop_count": state.loop_count},
-            "No screenshots present; requesting upgrade",
+            state.child_profile,
+            extra_text=ocr_text,
+            fast_scores=state.fast_scores or None,
         )
-        state.next_tool = "planner"
-        return state
-
-    ocr_text = ocr_agent.extract_text(screenshots)
-    if not ocr_text:
+        state.fast_scores = refreshed.fast_scores
+        state.judge_json = refreshed.llm_decision
+        state.confidence = refreshed.confidence
+        state.need_ocr = False
+        state.needs_screenshot = False
         log_agent_step(
             "OCRAgent",
-            "ocr_empty",
+            "ocr_run",
             state.event,
             {"screenshot_count": len(screenshots)},
-            {"ocr_text": ""},
-            {"loop_count": state.loop_count},
-            "OCR returned empty text",
+            {"ocr_text_preview": ocr_text[:120], "llm_decision": refreshed.llm_decision, "confidence": refreshed.confidence},
+            {},
+            "OCR executed; re-judged with OCR text",
         )
-        state.next_tool = "planner"
         return state
 
-    state.ocr_text = ocr_text
-    refreshed = url_agent.run(
-        state.event,
-        state.child_profile,
-        extra_text=ocr_text,
-        fast_scores=state.fast_scores or None,
-    )
-    state.fast_scores = refreshed.fast_scores
-    state.judge_json = refreshed.llm_decision
-    state.confidence = refreshed.confidence
-    state.need_ocr = False
+    # No screenshots attached.
+    if state.is_upgrade:
+        # An upgrade already carried its screenshots; if none arrived, don't loop —
+        # make sure we hold a judgment so policy doesn't default-allow.
+        if not state.judge_json:
+            refreshed = url_agent.run(
+                state.event,
+                state.child_profile,
+                fast_scores=state.fast_scores or None,
+            )
+            state.judge_json = refreshed.llm_decision
+            state.confidence = refreshed.confidence
+        state.needs_screenshot = False
+        return state
+
+    # First pass: ask the extension for a screenshot. Runtime emits an interim
+    # pending_ocr (warn — never allow) and waits for the /v1/event/upgrade re-run.
+    state.needs_screenshot = True
     log_agent_step(
         "OCRAgent",
-        "ocr_run",
+        "ocr_request",
         state.event,
-        {"screenshot_count": len(screenshots)},
-        {
-            "ocr_text_preview": ocr_text[:120],
-            "llm_decision": refreshed.llm_decision,
-            "confidence": refreshed.confidence,
-        },
-        {"loop_count": state.loop_count},
-        "OCR executed for event. Future OCR attempts disabled.",
+        {"needs_screenshot": True},
+        {"screenshot_count": 0},
+        {},
+        "No screenshots present; requesting upgrade",
     )
-    state.next_tool = "planner"
     return state
 
 
-def node_policy_layer(state: MonitorState) -> MonitorState:
-    decision = policy_agent.run(state, state.child_profile)
-    state.final_decision = decision
+def node_policy(state: MonitorState) -> MonitorState:
+    state.final_decision = policy_agent.run(state, state.child_profile)
     state.last_tool_run = "policy"
-    state.next_tool = "stop"
     return state
 
 
 graph = StateGraph(MonitorState)
-graph.add_node("planner", node_planner)
-graph.add_node("headline_layer", node_headline_layer)
-graph.add_node("url_layer", node_url_layer)
-graph.add_node("ocr_layer", node_ocr_layer)
-graph.add_node("policy_layer", node_policy_layer)
+graph.add_node("headline", node_headline)
+graph.add_node("url_llm", node_url_llm)
+graph.add_node("ocr", node_ocr)
+graph.add_node("policy", node_policy)
 
 
-def _route_from_planner(state: MonitorState) -> str:
-    # Prevent headline/ocr after OCR has run
-    if state.has_ocr_run and state.next_tool in {"ocr", "headline"}:
-        log_agent_step(
-            "PlannerAgent",
-            "override",
-            state.event,
-            {"requested": state.next_tool},
-            {"next_tool": "url_llm"},
-            {"loop_count": state.loop_count, "has_ocr_run": state.has_ocr_run},
-            "Prevented OCR/headline rerun after OCR; routing to URL agent",
-        )
-        return "url_llm"
-    return state.next_tool or "policy"
+def _entry(state: MonitorState) -> str:
+    # A screenshot upgrade carries its screenshots — go straight to OCR; otherwise
+    # start with the cheap headline layer.
+    return "ocr" if state.is_upgrade else "headline"
 
 
-graph.add_conditional_edges(
-    "planner",
-    _route_from_planner,
-    {
-        "headline": "headline_layer",
-        "url_llm": "url_layer",
-        "ocr": "ocr_layer",
-        "policy": "policy_layer",
-        "stop": END,
-    },
-)
-# After any tool, return to planner unless policy/stop.
-graph.add_edge("headline_layer", "planner")
-graph.add_edge("url_layer", "planner")
-graph.add_edge("ocr_layer", "planner")
-graph.add_edge("policy_layer", END)
-graph.add_edge(START, "planner")
+def _after_headline(state: MonitorState) -> str:
+    return "policy" if not state.need_llm else "url_llm"
+
+
+def _after_url(state: MonitorState) -> str:
+    # Defer to OCR only when the judgment is ambiguous AND OCR is enabled. With
+    # OCR off, decide now from the LLM judgment instead of stalling.
+    if state.need_ocr and settings.enable_ocr:
+        return "ocr"
+    return "policy"
+
+
+def _after_ocr(state: MonitorState) -> str:
+    # Only end without a decision when we actually requested a screenshot; runtime
+    # then emits the interim pending_ocr and waits for the upgrade.
+    return "pending" if state.needs_screenshot else "policy"
+
+
+graph.add_conditional_edges(START, _entry, {"headline": "headline", "ocr": "ocr"})
+graph.add_conditional_edges("headline", _after_headline, {"policy": "policy", "url_llm": "url_llm"})
+graph.add_conditional_edges("url_llm", _after_url, {"ocr": "ocr", "policy": "policy"})
+graph.add_conditional_edges("ocr", _after_ocr, {"policy": "policy", "pending": END})
+graph.add_edge("policy", END)
 app_graph = graph.compile()

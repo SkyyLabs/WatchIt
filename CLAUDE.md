@@ -52,7 +52,7 @@ packages/core           Shared config, DB repository, policy engine, url cache, 
 ### Request flow (load-bearing path)
 
 1. Extension `POST /v1/event` → API writes a queued job to Postgres, returns `status=queued` immediately.
-2. `services/agent-worker` claims queued jobs and runs the pipeline in `watchit_agents/runtime.py`: pause check → profile load → URL decision-cache lookup → LangGraph (`graph.py`: url/headlines/ocr/planner/policy agents) → analysis + decision writes → SSE publish. Emits per-step timing logs.
+2. `services/agent-worker` claims queued jobs and runs the pipeline in `watchit_agents/runtime.py`: pause check → profile load → URL decision-cache lookup → LangGraph (`graph.py`: deterministic headline→url_llm→ocr→policy routing, no LLM planner) → analysis + decision writes → SSE publish. Emits per-step timing logs.
 3. On OCR need, the extension screenshots and `POST /v1/event/upgrade` re-enqueues with image data.
 4. Dashboard reads history from Postgres and streams live decisions via `GET /v1/stream/decisions` (SSE) after Clerk sign-in.
 
@@ -61,7 +61,7 @@ The queue is Postgres-backed (`packages/core/src/watchit_core/services/queue.py`
 ### Key modules
 
 - `apps/api/src/watchit_api/`: `main.py` (FastAPI app + startup), `auth.py` (guardian + device auth), `schemas.py` (Pydantic request models), `sse.py` (decision stream).
-- `services/agent-worker/src/watchit_agents/`: `runtime.py` (pipeline orchestration), `graph.py` + `agents/*` (url, headlines, ocr, planner, policy), `llm_provider.py` (provider selection), `llm_judge.py`, `safety.py`, `ocr_asr.py` (Docling), `worker.py` (queue consumer).
+- `services/agent-worker/src/watchit_agents/`: `runtime.py` (pipeline orchestration), `graph.py` + `agents/*` (headlines, url, ocr, policy), `llm_provider.py` (provider selection), `llm_judge.py`, `safety.py`, `ocr_asr.py` (Docling), `worker.py` (queue consumer).
 - `packages/core/src/watchit_core/`: `db.py` (repository), `config.py`, `policy/engine.py`, `url_cache.py`, `screenshot_store.py`, `services/queue.py`, `migrations.py`, `logging.py`.
 - `apps/dashboard/src/`: routes under `app/`, UI in `components/` (shadcn/ui primitives under `components/ui`), HTTP client in `lib/api-client.ts`, Clerk middleware in `proxy.ts`.
 
