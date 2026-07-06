@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { apiFetch } from "@/lib/api-client";
+import { QuietHours } from "@/components/dashboard/quiet-hours";
 import type { ChildProfile } from "@/lib/dashboard-model";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -54,6 +55,7 @@ function ChildCard({ child, getToken, onCreatePairingCode, onStartMonitoring, on
   const [devices, setDevices] = useState<DeviceRow[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showQuiet, setShowQuiet] = useState(false);
   const [showDevices, setShowDevices] = useState(false);
   const [monitoring, setMonitoring] = useState<boolean>(Boolean(child.monitoring_active));
 
@@ -146,7 +148,12 @@ function ChildCard({ child, getToken, onCreatePairingCode, onStartMonitoring, on
           >
             {showDevices ? "Hide devices" : "View devices"}
           </Button>
+          <Button variant="ghost" onClick={() => setShowQuiet((v) => !v)}>
+            {showQuiet ? "Hide quiet hours" : "Quiet hours"}
+          </Button>
         </div>
+
+        {showQuiet && <QuietHours childId={child.id} getToken={getToken} />}
 
         {code && (
           <Alert>
