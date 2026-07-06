@@ -34,7 +34,11 @@ run: run-api
 
 
 run-api:
-	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/uvicorn watchit_api.main:app --reload --host 127.0.0.1 --port 4849
+	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/uvicorn watchit_api.main:app --reload \
+		--reload-dir apps/api/src --reload-dir services/agent-worker/src \
+		--reload-dir services/learning-worker/src --reload-dir packages/core/src \
+		--reload-exclude 'logs/*' --reload-exclude 'screenshots/*' --reload-exclude '*.log' \
+		--host 127.0.0.1 --port 4849
 
 
 run-agent-worker:

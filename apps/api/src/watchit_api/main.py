@@ -9,20 +9,30 @@ from starlette.background import BackgroundTask
 from starlette.responses import Response
 from pydantic import BaseModel
 from typing import Literal, Optional
-from watchit_api.schemas import EventInput
+from watchit_api.schemas import ClientLogBatch, EventInput
 from watchit_core.db import db
 from watchit_core.config import settings
+from watchit_core.logging import bind_log_context, clear_log_context, configure_logging, get_logger, shutdown_logging
+
+# Configure logging before importing the agent modules: graph.py builds the LLM
+# judge/agents at module import and logs `llm_provider_selected` — that line must
+# render through the JSON handler, not structlog's default console renderer.
+configure_logging("api")
+logger = get_logger("watchit.api")
+
 from watchit_agents.runtime import process_event, bus, publish_decision_row, _decision_message_from_row
 from watchit_agents.worker import AgentWorker
 from watchit_learning.guardian_learning import GuardianLearningLoop
 from watchit_api.auth import require_device, require_device_stream, require_guardian, require_guardian_stream
-from watchit_core.logging import bind_log_context, clear_log_context, configure_logging, get_logger
 from watchit_core.url_cache import url_cache_key
 
 from watchit_core.activity_logger import log_service_event, log_service_shutdown
 
-configure_logging("api")
-logger = get_logger("watchit.api")
+# Importing watchit_agents.worker above ran its module-level
+# configure_logging("agent-worker"), which (logging already configured) only
+# rebinds the structlog service context. Restore "api" so API startup/shutdown
+# and other non-request records aren't misclassified as the worker in the drain.
+bind_log_context(service="api")
 
 app = FastAPI(title="WatchIt Local API", version="0.2.0", description="Local-only parental monitoring with Docling OCR and predictive blocking")
 _learning_loop: GuardianLearningLoop | None = None
@@ -52,7 +62,7 @@ async def request_logging_middleware(request: Request, call_next):
         method=request.method,
         path=request.url.path,
     )
-    logger.info("request_started")
+    logger.debug("request_started")
     status_code = 500
     try:
         response: Response = await call_next(request)
@@ -64,7 +74,7 @@ async def request_logging_middleware(request: Request, call_next):
         raise
     finally:
         duration_ms = round((time.perf_counter() - start) * 1000, 2)
-        logger.info("request_finished", status_code=status_code, duration_ms=duration_ms)
+        logger.debug("request_finished", status_code=status_code, duration_ms=duration_ms)
         clear_log_context()
 
 
@@ -107,6 +117,8 @@ async def _shutdown():
             pass
         _learning_task = None
     db.close()
+    # Drain the async log listener last so shutdown records still reach stdout.
+    shutdown_logging()
 
 PIN_POLICY = {"min_length": 4, "max_length": 8, "digits_only": True}
 
@@ -308,6 +320,26 @@ async def patch_control(body: ControlPatchPayload, guardian_ctx=Depends(require_
     log_service_event("monitor_paused", {"minutes_requested": minutes, "paused_until_ms": until_ms})
     logger.info("monitor_paused", minutes_requested=minutes, paused_until_ms=until_ms)
     return {"ok": True, "paused_until": until_ms}
+
+client_logger = get_logger("watchit.dashboard-client")
+
+
+@app.post("/v1/client-logs", status_code=202)
+async def ingest_client_logs(payload: ClientLogBatch, guardian_ctx=Depends(require_guardian)):
+    # Dashboard browser logs, shipped here so the log drain captures them too.
+    # Scoped to the authenticated household; no DB write — just re-emit to stdout.
+    household_id = guardian_ctx["household"]["id"]
+    for entry in payload.entries:
+        method = "warning" if entry.level == "warn" else entry.level
+        getattr(client_logger, method)(
+            entry.message,
+            service="dashboard-client",
+            household_id=household_id,
+            client_ts=entry.ts,
+            context=entry.context,
+        )
+    return {"ok": True, "count": len(payload.entries)}
+
 
 @app.get("/v1/children")
 def list_children(guardian_ctx=Depends(require_guardian)):

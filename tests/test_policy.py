@@ -1,15 +1,30 @@
 """Policy engine decision guarantees (packages/core policy engine).
 
-Cases are chosen to be time-of-day independent: hard blocklist domains block in
-every branch, and educational allowlist domains allow even during quiet hours.
+Cases are time-of-day independent: blocklist domains block in every branch,
+allowlist domains allow even during quiet hours, and score/threshold cases use
+the `no_quiet_hours` fixture so the schedule quiet-hours block can't preempt them
+depending on the wall clock.
 """
 from datetime import datetime
 
+import pytest
+
+from watchit_core.config import settings
 from watchit_core.policy.engine import PolicyEngine, _in_quiet_hours
 
 
 def _event(url):
     return {"url": url}
+
+
+@pytest.fixture
+def no_quiet_hours(monkeypatch):
+    """Neutralize the schedule quiet-hours window so score/threshold cases are
+    evaluated deterministically regardless of the wall clock (CI runs in UTC,
+    inside the default 21:00-07:00 window). Emptying the schedule days makes no
+    weekday ever match, so the quiet-hours branch is skipped without parsing a
+    time range."""
+    monkeypatch.setattr(settings, "sched_days", "")
 
 
 def test_blocklist_domain_always_blocks():
@@ -23,13 +38,13 @@ def test_edu_allowlist_domain_always_allows():
     assert decision["action"] == "allow"
 
 
-def test_prefilter_high_score_blocks():
+def test_prefilter_high_score_blocks(no_quiet_hours):
     decision = PolicyEngine().decide(_event("https://news.example.com"), {"sexual": 0.99}, {})
     assert decision["action"] == "block"
     assert "sexual" in decision["categories"]
 
 
-def test_strict_threshold_lower_than_standard():
+def test_strict_threshold_lower_than_standard(no_quiet_hours):
     # 0.85 blocks under strict (0.8) but not standard (0.9).
     engine = PolicyEngine()
     strict = engine.decide(_event("https://news.example.com"), {"violence": 0.85}, {}, {"strictness": "strict"})
