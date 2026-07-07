@@ -33,6 +33,14 @@ type FormState = {
 
 type TestResult = { action: string; layer: string; detail: string };
 
+type Suggestion = {
+  id: string;
+  child_id: string | null;
+  action: "allow" | "block";
+  pattern: string;
+  evidence_count: number;
+};
+
 const LAYER_LABEL: Record<string, string> = {
   rule: "your rule",
   schedule: "quiet hours",
@@ -49,6 +57,7 @@ export function RulesManager({ childId, getToken }: { childId: string; getToken:
   const [testUrl, setTestUrl] = useState("");
   const [testResult, setTestResult] = useState<TestResult | null>(null);
   const [testing, setTesting] = useState(false);
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
 
   const load = useCallback(async () => {
     setError(null);
@@ -56,10 +65,27 @@ export function RulesManager({ childId, getToken }: { childId: string; getToken:
       const authToken = await getToken();
       const data = await apiFetch<{ rules: Rule[] }>(`/v1/rules?child_id=${encodeURIComponent(childId)}`, authToken);
       setRules(data.rules || []);
+      const sug = await apiFetch<{ suggestions: Suggestion[] }>("/v1/rule-suggestions", authToken);
+      // Household-wide endpoint; show only suggestions relevant to this child.
+      setSuggestions((sug.suggestions || []).filter((s) => !s.child_id || s.child_id === childId));
     } catch (e) {
       setError(String(e));
     }
   }, [childId, getToken]);
+
+  const resolveSuggestion = async (id: string, verb: "accept" | "dismiss") => {
+    setBusy(true);
+    setError(null);
+    try {
+      const authToken = await getToken();
+      await apiFetch(`/v1/rule-suggestions/${encodeURIComponent(id)}/${verb}`, authToken, { method: "POST" });
+      await load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   useEffect(() => {
     void load();
@@ -138,6 +164,34 @@ export function RulesManager({ childId, getToken }: { childId: string; getToken:
           Enforced instantly on the device — no AI wait. Device rules beat child rules; block beats allow.
         </span>
       </div>
+
+      {suggestions.length > 0 && (
+        <div className="space-y-2 rounded-md border border-dashed bg-background p-3">
+          <p className="text-sm font-medium">Suggested rules</p>
+          <p className="text-xs text-muted-foreground">
+            Based on your repeated overrides. Nothing applies until you accept it.
+          </p>
+          {suggestions.map((s) => (
+            <div key={s.id} className="flex flex-col gap-2 rounded-md border bg-background p-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <Badge variant={s.action === "block" ? "destructive" : "success"}>{s.action}</Badge>
+                <span className="font-medium break-all">{s.pattern}</span>
+                <span className="text-xs text-muted-foreground">
+                  you overrode this {s.evidence_count} times
+                </span>
+              </div>
+              <div className="flex gap-2">
+                <Button size="sm" disabled={busy} onClick={() => resolveSuggestion(s.id, "accept")}>
+                  Accept
+                </Button>
+                <Button size="sm" variant="ghost" disabled={busy} onClick={() => resolveSuggestion(s.id, "dismiss")}>
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {rules.length > 0 && (
         <div className="space-y-2">

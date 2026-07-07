@@ -613,6 +613,84 @@ class Database:
             )
             return cur.rowcount
 
+    SUGGESTION_MIN_OVERRIDES = 3
+    SUGGESTION_WINDOW_DAYS = 30
+
+    def generate_rule_suggestions(self) -> int:
+        """Distill repeated same-direction overrides into pending rule
+        suggestions (learned rules with guardian review — never auto-applied).
+
+        A candidate is (household, child, domain, action) with >= 3 overrides in
+        30 days, no enabled rule already covering the domain, no pending
+        suggestion, and no dismissal within the window (a guardian's "no" is
+        respected, not re-asked weekly). Platform-wide by design, like the
+        retention sweep — the learning loop is not a per-tenant request path.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH candidates AS (
+                    SELECT o.household_id, e.child_id, e.domain AS pattern, o.action, COUNT(*) AS n
+                    FROM decision_overrides o
+                    JOIN decisions d ON o.decision_id = d.id
+                    JOIN events e ON d.event_id = e.id
+                    WHERE o.created_at > now() - make_interval(days => %s)
+                      AND o.action IN ('allow', 'block')
+                      AND COALESCE(e.domain, '') <> ''
+                    GROUP BY o.household_id, e.child_id, e.domain, o.action
+                    HAVING COUNT(*) >= %s
+                )
+                INSERT INTO rule_suggestions(id, household_id, child_id, action, rule_type, pattern, evidence_count)
+                SELECT 'rsug_' || replace(gen_random_uuid()::text, '-', ''),
+                       c.household_id, c.child_id, c.action, 'domain', c.pattern, c.n
+                FROM candidates c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM policy_rules r
+                    WHERE r.household_id = c.household_id AND r.enabled = TRUE AND r.pattern = c.pattern
+                      AND (r.child_id IS NULL OR r.child_id = c.child_id)
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM rule_suggestions s
+                    WHERE s.household_id = c.household_id
+                      AND COALESCE(s.child_id, '') = COALESCE(c.child_id, '')
+                      AND s.pattern = c.pattern AND s.action = c.action
+                      AND (s.status = 'pending'
+                           OR (s.status = 'dismissed' AND s.decided_at > now() - make_interval(days => %s)))
+                )
+                """,
+                (self.SUGGESTION_WINDOW_DAYS, self.SUGGESTION_MIN_OVERRIDES, self.SUGGESTION_WINDOW_DAYS),
+            )
+            return cur.rowcount
+
+    def list_rule_suggestions(self, household_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM rule_suggestions
+                WHERE household_id=%s AND status='pending'
+                ORDER BY evidence_count DESC, created_at DESC
+                """,
+                (household_id,),
+            )
+            return cur.fetchall()
+
+    def resolve_rule_suggestion(
+        self, suggestion_id: str, household_id: str, *, status: str, guardian_id: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        # accepted/dismissed; returns the suggestion row or None when it isn't
+        # this household's pending suggestion.
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE rule_suggestions
+                SET status=%s, decided_at=now(), decided_by_guardian_id=%s
+                WHERE id=%s AND household_id=%s AND status='pending'
+                RETURNING *
+                """,
+                (status, guardian_id, suggestion_id, household_id),
+            )
+            return cur.fetchone()
+
     def list_active_rules(
         self, household_id: str, child_id: Optional[str], device_id: Optional[str]
     ) -> List[Dict[str, Any]]:
