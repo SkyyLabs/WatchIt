@@ -19,6 +19,7 @@ from psycopg_pool import ConnectionPool
 from watchit_core.config import settings
 from watchit_core.migrations import run_migrations
 from watchit_core.url_cache import normalize_url
+from watchit_core.policy.rules import HIGH_RISK_TOKENS
 
 
 class Database:
@@ -27,6 +28,13 @@ class Database:
     PARENT_PIN_KEY = "parent_pin"
     PARENT_PIN_ALGORITHM = "pbkdf2_sha256"
     PARENT_PIN_ITERATIONS = 260_000
+    DEVICE_TOKEN_TTL_DAYS = 30
+    # Grace window during which a rotated-out token still authenticates, so a
+    # lost rotation response can't brick the device.
+    TOKEN_ROTATION_GRACE_MINUTES = 60
+    POLICY_SNAPSHOT_TTL_SECONDS = 86_400
+    POLICY_SNAPSHOT_REFRESH_SECONDS = 900
+    POLICY_SNAPSHOT_CACHE_LIMIT = 200
 
     def __init__(self, dsn: Optional[str] = None):
         self.dsn = dsn
@@ -452,7 +460,7 @@ class Database:
             cur.execute(
                 """
                 SELECT id, child_id, device_name, browser_name, status,
-                       last_seen_at, paused_until, created_at
+                       last_seen_at, policy_fetched_at, paused_until, created_at
                 FROM devices
                 WHERE household_id=%s AND child_id=%s AND status<>'revoked'
                 ORDER BY created_at DESC
@@ -460,6 +468,207 @@ class Database:
                 (household_id, child_id),
             )
             return cur.fetchall()
+
+    # --- Guardian manual allow/block rules --------------------------------------
+
+    def create_rule(
+        self,
+        household_id: str,
+        *,
+        action: str,
+        rule_type: str,
+        pattern: str,
+        child_id: Optional[str] = None,
+        device_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        created_by_guardian_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO policy_rules(
+                    id, household_id, child_id, device_id, action, rule_type, pattern,
+                    reason, created_by_guardian_id, expires_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    self._new_id("rule"),
+                    household_id,
+                    child_id,
+                    device_id,
+                    action,
+                    rule_type,
+                    pattern,
+                    reason,
+                    created_by_guardian_id,
+                    expires_at,
+                ),
+            )
+            return cur.fetchone()
+
+    def list_rules(self, household_id: str, child_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        # Guardian view: household-wide rules plus (optionally) one child's rules.
+        with self._connect() as conn, conn.cursor() as cur:
+            params: List[Any] = [household_id]
+            scope = ""
+            if child_id:
+                params.append(child_id)
+                scope = " AND (child_id IS NULL OR child_id=%s)"
+            cur.execute(
+                f"""
+                SELECT * FROM policy_rules
+                WHERE household_id=%s AND enabled=TRUE
+                {scope}
+                ORDER BY created_at DESC
+                """,
+                params,
+            )
+            return cur.fetchall()
+
+    def delete_rule(self, rule_id: str, household_id: str) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM policy_rules WHERE id=%s AND household_id=%s",
+                (rule_id, household_id),
+            )
+            return cur.rowcount
+
+    def list_active_rules(
+        self, household_id: str, child_id: Optional[str], device_id: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """Enforcement view: every enabled, unexpired rule that applies to this
+        child+device (household-wide rules included). Precedence is resolved by
+        watchit_core.policy.rules.evaluate_rules."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, household_id, child_id, device_id, action, rule_type,
+                       pattern, reason, expires_at, enabled
+                FROM policy_rules
+                WHERE household_id=%s AND enabled=TRUE
+                  AND (child_id IS NULL OR child_id=%s)
+                  AND (device_id IS NULL OR device_id=%s)
+                  AND (expires_at IS NULL OR expires_at > now())
+                ORDER BY created_at ASC
+                """,
+                (household_id, child_id, device_id),
+            )
+            return cur.fetchall()
+
+    # --- Device policy snapshot --------------------------------------------------
+
+    @staticmethod
+    def _to_epoch_ms(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return int(value.timestamp() * 1000)
+        return None
+
+    def list_snapshot_cached_decisions(self, household_id: str, child_id: Optional[str]) -> List[Dict[str, Any]]:
+        min_updated_at = int(time.time() * 1000) - settings.url_decision_cache_ttl_seconds * 1000
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT normalized_url, action, reason, details_json, source
+                FROM url_decision_cache
+                WHERE household_id=%s AND child_id=%s AND updated_at >= %s
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (household_id, child_id, min_updated_at, self.POLICY_SNAPSHOT_CACHE_LIMIT),
+            )
+            rows = cur.fetchall()
+        # Only high-confidence entries are safe to enforce locally.
+        out = []
+        for row in rows:
+            details = row.get("details_json") or {}
+            confidence = float(details.get("confidence", 0.0) or 0.0)
+            if row.get("source") == "manual_override" or confidence >= settings.url_decision_cache_min_confidence:
+                out.append({
+                    "normalized_url": row["normalized_url"],
+                    "action": row["action"],
+                    "reason": row.get("reason") or "",
+                })
+        return out
+
+    def stamp_policy_fetch(self, device_id: str) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE devices SET policy_fetched_at=now() WHERE id=%s", (device_id,))
+
+    def build_policy_snapshot(self, device: Dict[str, Any]) -> Dict[str, Any]:
+        """Versioned, self-contained policy view for one device. The extension
+        stores it locally and enforces layers 1-4 without a network round trip."""
+        household_id = device["household_id"]
+        child_id = device.get("child_id")
+        device_id = device["id"]
+        profile = self.get_child_profile(child_id, household_id) if child_id else None
+
+        rules = []
+        for rule in self.list_active_rules(household_id, child_id, device_id):
+            scope = "device" if rule.get("device_id") else ("child" if rule.get("child_id") else "household")
+            rules.append({
+                "id": rule["id"],
+                "action": rule["action"],
+                "rule_type": rule["rule_type"],
+                "pattern": rule["pattern"],
+                "scope": scope,
+                "child_id": rule.get("child_id"),
+                "device_id": rule.get("device_id"),
+                "expires_at": self._to_epoch_ms(rule.get("expires_at")),
+            })
+
+        quiet_hours = [
+            {
+                "days": s.get("days") or "",
+                "quiet_start": s.get("quiet_start"),
+                "quiet_end": s.get("quiet_end"),
+                "timezone": s.get("timezone"),
+                "device_id": s.get("device_id"),
+            }
+            for s in (self.get_effective_quiet_schedules(household_id, child_id, device_id) if child_id else [])
+        ]
+
+        household_pause = self.get_paused_until(household_id)
+        device_pause = device.get("paused_until")
+        pauses = [p for p in (household_pause, device_pause) if p]
+
+        content = {
+            "household_id": household_id,
+            "child_id": child_id,
+            "device_id": device_id,
+            "policy_version": settings.policy_version,
+            "device_status": device.get("status"),
+            "monitoring_enabled": self.is_household_monitoring_enabled(household_id),
+            "monitoring_active": bool(
+                child_id and self.get_active_monitoring_session(household_id, child_id, device_id)
+            ),
+            "paused_until": max(pauses) if pauses else None,
+            "strictness": (profile or {}).get("strictness") or "standard",
+            "rules": rules,
+            "quiet_hours": quiet_hours,
+            "cached_decisions": self.list_snapshot_cached_decisions(household_id, child_id),
+            "high_risk_tokens": HIGH_RISK_TOKENS,
+        }
+        version = hashlib.sha256(
+            json.dumps(content, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+        now_ms = int(time.time() * 1000)
+        return {
+            **content,
+            "version": version,
+            "issued_at": now_ms,
+            "expires_at": now_ms + self.POLICY_SNAPSHOT_TTL_SECONDS * 1000,
+            "refresh_after_seconds": self.POLICY_SNAPSHOT_REFRESH_SECONDS,
+            "token_expires_at": self._to_epoch_ms(device.get("token_expires_at")),
+        }
 
     def get_device_paused_until(self, device_id: str) -> Optional[int]:
         with self._connect() as conn, conn.cursor() as cur:
@@ -1097,9 +1306,10 @@ class Database:
                 """
                 INSERT INTO devices(
                     id, household_id, child_id, device_name, device_type, browser_name, browser_version,
-                    extension_version, install_id, token_hash, status, last_seen_at
+                    extension_version, install_id, token_hash, token_expires_at, status, last_seen_at
                 )
-                VALUES (%s, %s, %s, %s, 'browser_extension', %s, %s, %s, %s, %s, 'active', now())
+                VALUES (%s, %s, %s, %s, 'browser_extension', %s, %s, %s, %s, %s,
+                        now() + make_interval(days => %s), 'active', now())
                 ON CONFLICT (install_id) DO UPDATE SET
                     household_id=EXCLUDED.household_id,
                     child_id=EXCLUDED.child_id,
@@ -1108,6 +1318,9 @@ class Database:
                     browser_version=EXCLUDED.browser_version,
                     extension_version=EXCLUDED.extension_version,
                     token_hash=EXCLUDED.token_hash,
+                    token_expires_at=EXCLUDED.token_expires_at,
+                    token_prev_hash=NULL,
+                    token_rotated_at=NULL,
                     status='active',
                     last_seen_at=now(),
                     updated_at=now()
@@ -1123,6 +1336,7 @@ class Database:
                     extension_version,
                     install_id,
                     token_hash,
+                    self.DEVICE_TOKEN_TTL_DAYS,
                 ),
             )
             device = cur.fetchone()
@@ -1146,19 +1360,76 @@ class Database:
                 }
         return {"device": device, "device_token": device_token, "reassigned": reassigned}
 
-    def authenticate_device_token(self, token: str) -> Optional[Dict[str, Any]]:
+    def resolve_device_token(self, token: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Resolve a raw device token to (device, error).
+
+        error is None on success, else one of: 'invalid', 'device_revoked',
+        'token_expired'. Distinct errors let the extension tell "re-pair needed"
+        apart from "rotate needed". A token rotated out within the grace window
+        still authenticates.
+        """
         token_hash = self._token_hash(token)
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
+                SELECT *,
+                       (token_hash=%s) AS matched_current,
+                       (token_prev_hash=%s
+                        AND token_rotated_at > now() - make_interval(mins => %s)) AS matched_prev
+                FROM devices
+                WHERE token_hash=%s OR token_prev_hash=%s
+                """,
+                (token_hash, token_hash, self.TOKEN_ROTATION_GRACE_MINUTES, token_hash, token_hash),
+            )
+            device = cur.fetchone()
+            if not device or not (device["matched_current"] or device["matched_prev"]):
+                return None, "invalid"
+            if device.get("status") != "active":
+                return None, "device_revoked"
+            expires_at = device.get("token_expires_at")
+            if device["matched_current"] and expires_at is not None and expires_at <= datetime.now(timezone.utc):
+                return None, "token_expired"
+            cur.execute(
+                "UPDATE devices SET last_seen_at=now(), updated_at=now() WHERE id=%s",
+                (device["id"],),
+            )
+            device.pop("matched_current", None)
+            device.pop("matched_prev", None)
+            return device, None
+
+    def authenticate_device_token(self, token: str) -> Optional[Dict[str, Any]]:
+        device, error = self.resolve_device_token(token)
+        return device if error is None else None
+
+    def rotate_device_token(self, device_id: str) -> Optional[Tuple[Dict[str, Any], str]]:
+        """Issue a fresh token for an active device; the old one keeps working
+        for TOKEN_ROTATION_GRACE_MINUTES. Returns (device_row, new_raw_token)."""
+        new_token = f"wdev_{secrets.token_urlsafe(32)}"
+        new_hash = self._token_hash(new_token)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
                 UPDATE devices
-                SET last_seen_at=now(), updated_at=now()
-                WHERE token_hash=%s AND status='active'
+                SET token_prev_hash=token_hash,
+                    token_rotated_at=now(),
+                    token_hash=%s,
+                    token_expires_at=now() + make_interval(days => %s),
+                    updated_at=now()
+                WHERE id=%s AND status='active'
                 RETURNING *
                 """,
-                (token_hash,),
+                (new_hash, self.DEVICE_TOKEN_TTL_DAYS, device_id),
             )
-            return cur.fetchone()
+            device = cur.fetchone()
+        if not device:
+            return None
+        return device, new_token
+
+    def get_event_household(self, event_id: str) -> Optional[str]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT household_id FROM events WHERE id=%s", (event_id,))
+            row = cur.fetchone()
+            return row["household_id"] if row else None
 
     def start_monitoring_session(
         self,

@@ -5,9 +5,16 @@ from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 from watchit_agents.safety import SafetyAnalyzer
+from watchit_core.policy.rules import HIGH_RISK_TOKENS, domain_suffix_match
 
-HIGH_RISK_TOKENS = ["porn", "xxx", "casino", "bet", "nsfw", "escort"]
 LOW_RISK_DOMAINS = ["wikipedia.org", "khanacademy.org", ".edu"]
+
+
+def _domain_has_token(domain: str, token: str) -> bool:
+    # Match against host labels, anchored at the label start ("pornhub" matches
+    # "porn", "bet365" matches "bet") — never bare substring ("alphabet" must not
+    # match "bet"; see gap analysis B6).
+    return any(label == token or label.startswith(token) for label in domain.split("."))
 
 
 @dataclass
@@ -44,12 +51,12 @@ class HeadlinesAgent:
         action = "allow"
         confidence = 0.5
 
-        if any(token in domain or token in title for token in HIGH_RISK_TOKENS) or sexual >= 0.9 or violence >= 0.95:
+        if any(_domain_has_token(domain, token) or token in title for token in HIGH_RISK_TOKENS) or sexual >= 0.9 or violence >= 0.95:
             risk = "high"
             action = "block"
             flags.append("headline_high_risk")
             confidence = 0.9
-        elif sexual < 0.15 and violence < 0.2 and profanity < 0.2 and any(dom in domain for dom in LOW_RISK_DOMAINS):
+        elif sexual < 0.15 and violence < 0.2 and profanity < 0.2 and any(domain_suffix_match(domain, dom) for dom in LOW_RISK_DOMAINS):
             risk = "low"
             action = "allow"
             flags.append("headline_low_risk")

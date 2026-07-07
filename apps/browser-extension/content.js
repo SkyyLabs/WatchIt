@@ -1,15 +1,20 @@
-const BLUR_CLASS="__watchit_blur__"; const BANNER_ID="__watchit_warn__"; const INTERSTITIAL_ID="__watchit_block__"; const LOADER_ID="__watchit_loading__";
+const BLUR_CLASS="__watchit_blur__"; const BANNER_ID="__watchit_warn__"; const INTERSTITIAL_ID="__watchit_block__"; const LOADER_ID="__watchit_loading__"; const BADGE_ID="__watchit_badge__"; const DEGRADED_ID="__watchit_degraded__";
 
 // Never run on WatchIt's own surfaces (API + guardian dashboard). Hosts from config.js.
 const IS_WATCHIT_APP=WATCHIT_CONFIG.skipHosts.includes(location.host);
 
-// The extension holds the page (loader) until the safety decision arrives,
-// polling for it up to POLL_MAX_MS. Fail-open: if none arrives in that window
-// (unpaired, monitoring off, worker down) the loader clears so the page is
-// never trapped. LOADER_TIMEOUT_MS is a hard safety net matching the poll cap.
+// State-specific enforcement (see docs/LOW_LATENCY_ENFORCEMENT_DESIGN.md):
+// - local allow / inert: page renders untouched.
+// - local block (rule / quiet hours / cached): interstitial immediately, no wait.
+// - unknown: page renders with a small non-blocking "checking" badge; the backend
+//   decision is applied when it arrives (poll + SSE).
+// - unknown + high-risk local signal: hold with the loader briefly, then degrade
+//   to blur+warn (never allow) until the decision lands.
+// - legacy (no policy snapshot yet, e.g. old API): previous behavior — hold with
+//   the loader up to 20 s, then release.
 const POLL_INTERVAL_MS=1000;
-const POLL_MAX_MS=20000;
-const LOADER_TIMEOUT_MS=POLL_MAX_MS;
+const POLL_MAX_MS=20000;          // legacy hold + how long the checking badge polls
+const HIGHRISK_HOLD_MS=5000;      // loader cap for high-risk unknowns
 let loaderTimer=null;
 let decisionApplied=false; // once a decision is applied, stop polling
 
@@ -20,13 +25,17 @@ function ensureStyles(){
   s.textContent=`
     .${BLUR_CLASS} img, .${BLUR_CLASS} video, .${BLUR_CLASS} canvas, .${BLUR_CLASS} * { filter: blur(14px)!important; }
     /* Keep WatchIt's own UI crisp — id specificity overrides the .blur * rule above. */
-    #${BANNER_ID}, #${BANNER_ID} *, #${INTERSTITIAL_ID}, #${INTERSTITIAL_ID} *, #${LOADER_ID}, #${LOADER_ID} * { filter: none!important; }
+    #${BANNER_ID}, #${BANNER_ID} *, #${INTERSTITIAL_ID}, #${INTERSTITIAL_ID} *, #${LOADER_ID}, #${LOADER_ID} *, #${BADGE_ID}, #${BADGE_ID} *, #${DEGRADED_ID}, #${DEGRADED_ID} * { filter: none!important; }
     #${BANNER_ID}{position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#ffcc00;color:#000;padding:10px;text-align:center;font-family:sans-serif;box-shadow:0 2px 6px rgba(0,0,0,0.2)}
     #${LOADER_ID}{position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;background:rgba(15,17,26,0.96);backdrop-filter:blur(6px);color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
     #${LOADER_ID} .__wi_spin{width:44px;height:44px;border-radius:50%;border:4px solid rgba(255,255,255,0.18);border-top-color:#6366f1;animation:__wi_rot 0.8s linear infinite}
     #${LOADER_ID} .__wi_label{font-size:15px;font-weight:500;letter-spacing:.2px}
     #${LOADER_ID} .__wi_sub{font-size:12px;color:#9ca3af}
     @keyframes __wi_rot{to{transform:rotate(360deg)}}
+    #${BADGE_ID}{position:fixed;right:14px;bottom:14px;z-index:2147483646;display:flex;align-items:center;gap:8px;background:rgba(17,23,38,0.92);color:#cbd5e1;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:12px;padding:8px 12px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);box-shadow:0 6px 18px rgba(0,0,0,0.35)}
+    #${BADGE_ID} .__wi_dot{width:8px;height:8px;border-radius:50%;background:#6366f1;animation:__wi_pulse 1.1s ease-in-out infinite}
+    @keyframes __wi_pulse{50%{opacity:.35}}
+    #${DEGRADED_ID}{position:fixed;left:0;right:0;bottom:0;z-index:2147483646;background:#7c2d12;color:#ffedd5;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:12px;padding:6px 12px;text-align:center}
     #${INTERSTITIAL_ID}{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:24px;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:radial-gradient(1200px 600px at 50% -10%,#1e293b 0%,#0b0f1a 60%)}
     #${INTERSTITIAL_ID} .__wi_card{max-width:520px;width:100%;background:#111726;border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:34px 30px;box-shadow:0 30px 80px rgba(0,0,0,0.55);color:#e5e7eb;text-align:center}
     #${INTERSTITIAL_ID} .__wi_badge{width:64px;height:64px;margin:0 auto 18px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:30px;background:rgba(239,68,68,0.14);border:1px solid rgba(239,68,68,0.35)}
@@ -53,11 +62,27 @@ function showLoading(){
   const sub=document.createElement("div"); sub.className="__wi_sub"; sub.textContent="Waiting for the safety decision";
   el.appendChild(spin); el.appendChild(label); el.appendChild(sub);
   document.documentElement.appendChild(el);
-  loaderTimer=setTimeout(clearLoading, LOADER_TIMEOUT_MS);
 }
 function clearLoading(){
   if(loaderTimer){ clearTimeout(loaderTimer); loaderTimer=null; }
   const el=document.getElementById(LOADER_ID); if(el) el.remove();
+}
+
+function showBadge(){
+  if(document.getElementById(BADGE_ID)) return;
+  const el=document.createElement("div"); el.id=BADGE_ID;
+  const dot=document.createElement("span"); dot.className="__wi_dot";
+  const label=document.createElement("span"); label.textContent="WatchIt is checking this page";
+  el.appendChild(dot); el.appendChild(label);
+  document.documentElement.appendChild(el);
+}
+function clearBadge(){ const el=document.getElementById(BADGE_ID); if(el) el.remove(); }
+
+function showDegraded(){
+  if(document.getElementById(DEGRADED_ID)) return;
+  const el=document.createElement("div"); el.id=DEGRADED_ID;
+  el.textContent="WatchIt protection is degraded — the safety service is unreachable. Guardian rules still apply.";
+  document.documentElement.appendChild(el);
 }
 
 function warn(reason){
@@ -101,8 +126,8 @@ function block(parts){
 }
 
 function applyDecision(d){
-  // Interim decision while OCR is pending — keep holding and wait for the
-  // post-OCR final decision instead of latching onto the placeholder.
+  // Interim decision while OCR is pending — keep waiting for the post-OCR final
+  // decision instead of latching onto the placeholder.
   if(d && d.needs_ocr){ return; }
   const a=d.action;
   const rationale = d.llm_rationale;
@@ -114,6 +139,7 @@ function applyDecision(d){
   const r=reasonParts.join(" | ") || "policy";
   clearWarn();
   clearLoading();
+  clearBadge();
   if(a==="allow"){
     unblur();
   } else if(a==="warn" || a==="blur"){
@@ -130,16 +156,17 @@ function applyDecision(d){
 // Poll the service worker (which does the authed API fetch) until the decision
 // for this page is ready. Runs in the page, so it survives the MV3 worker being
 // evicted mid-wait — each message wakes the worker back up.
-function pollForDecision(){
+// onTimeout runs once when the poll window closes without a decision.
+function pollForDecision(onTimeout){
   const start=Date.now();
   const tick=()=>{
     if(decisionApplied) return;
-    if(Date.now()-start > POLL_MAX_MS){ clearLoading(); return; } // fail-open
+    if(Date.now()-start > POLL_MAX_MS){ if(onTimeout) onTimeout(); return; }
     chrome.runtime.sendMessage({ type:"watchit_get_decision" }, (resp)=>{
       if(decisionApplied) return;
       if(!chrome.runtime.lastError && resp){
         // Monitoring off or unpaired for this page — release it, don't keep holding.
-        if(resp.status==="inactive" || resp.status==="unpaired"){ clearLoading(); return; }
+        if(resp.status==="inactive" || resp.status==="unpaired"){ clearLoading(); clearBadge(); return; }
         if(resp.status==="decided" && resp.decision){
           applyDecision(resp.decision); // no-op if interim (needs_ocr) — keep polling
         }
@@ -150,10 +177,51 @@ function pollForDecision(){
   tick();
 }
 
-// Hold + poll only on paired browsers, so unmonitored devices are untouched.
+function startEnforcement(local){
+  switch(local && local.state){
+    case "inert":
+    case "allow":
+      return; // page untouched; SSE listener below still applies pushed decisions
+    case "block":
+    case "cached_block":
+      applyDecision(local.decision || { action: "block", reason: "policy" });
+      return;
+    case "cached_warn":
+    case "cached_blur":
+      applyDecision(local.decision || { action: "warn", reason: "cached decision" });
+      return;
+    case "unknown_highrisk":
+      // Hold briefly; if the backend hasn't answered, degrade to blur+warn —
+      // never fail open on a high-risk signal.
+      showLoading();
+      if(local.degraded) showDegraded();
+      loaderTimer=setTimeout(()=>{
+        if(decisionApplied) return;
+        clearLoading();
+        applyBlur();
+        warn("still checking this page");
+      }, HIGHRISK_HOLD_MS);
+      pollForDecision(()=>{ /* keep blur+warn until a decision or navigation */ });
+      return;
+    case "unknown":
+      showBadge();
+      if(local.degraded) showDegraded();
+      pollForDecision(()=>{ clearBadge(); });
+      return;
+    case "legacy":
+    default:
+      // No policy snapshot (old API or first run): previous behavior.
+      showLoading();
+      loaderTimer=setTimeout(clearLoading, POLL_MAX_MS);
+      pollForDecision(()=>{ clearLoading(); });
+      return;
+  }
+}
+
 if(!IS_WATCHIT_APP){
-  chrome.storage.local.get(["deviceToken"], (stored)=>{
-    if(stored && stored.deviceToken){ showLoading(); pollForDecision(); }
+  chrome.runtime.sendMessage({ type: "watchit_local_state", url: location.href }, (resp)=>{
+    if(chrome.runtime.lastError){ return; }
+    startEnforcement(resp || { state: "legacy" });
   });
 }
 

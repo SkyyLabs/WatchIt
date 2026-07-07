@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { apiFetch } from "@/lib/api-client";
 import { QuietHours } from "@/components/dashboard/quiet-hours";
+import { RulesManager } from "@/components/dashboard/rules-manager";
 import type { ChildProfile } from "@/lib/dashboard-model";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -16,8 +17,23 @@ type DeviceRow = {
   browser_name: string | null;
   status: string;
   last_seen_at: string | null;
+  policy_fetched_at: string | null;
   paused_until: number | null;
 };
+
+// Device health from last_seen_at (any authenticated call) + policy_fetched_at
+// (last policy-snapshot pull). Healthy means the extension is alive AND running
+// current rules; "stale rules" means it talks to the API but hasn't refreshed
+// its policy (broken/blocked extension); "offline" means silent for a day.
+function deviceHealth(device: DeviceRow): { label: string; variant: "success" | "warning" | "secondary" | "destructive" } {
+  const HOUR = 60 * 60 * 1000;
+  const seenAt = device.last_seen_at ? new Date(device.last_seen_at).getTime() : 0;
+  const policyAt = device.policy_fetched_at ? new Date(device.policy_fetched_at).getTime() : 0;
+  const now = Date.now();
+  if (now - seenAt > 24 * HOUR) return { label: "offline", variant: "destructive" };
+  if (now - policyAt > HOUR) return { label: "stale rules", variant: "warning" };
+  return { label: "protected", variant: "success" };
+}
 
 type Props = {
   children: ChildProfile[];
@@ -56,6 +72,7 @@ function ChildCard({ child, getToken, onCreatePairingCode, onStartMonitoring, on
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showQuiet, setShowQuiet] = useState(false);
+  const [showRules, setShowRules] = useState(false);
   const [showDevices, setShowDevices] = useState(false);
   const [monitoring, setMonitoring] = useState<boolean>(Boolean(child.monitoring_active));
 
@@ -151,9 +168,13 @@ function ChildCard({ child, getToken, onCreatePairingCode, onStartMonitoring, on
           <Button variant="ghost" onClick={() => setShowQuiet((v) => !v)}>
             {showQuiet ? "Hide quiet hours" : "Quiet hours"}
           </Button>
+          <Button variant="ghost" onClick={() => setShowRules((v) => !v)}>
+            {showRules ? "Hide rules" : "Rules"}
+          </Button>
         </div>
 
         {showQuiet && <QuietHours childId={child.id} getToken={getToken} />}
+        {showRules && <RulesManager childId={child.id} getToken={getToken} />}
 
         {code && (
           <Alert>
@@ -232,6 +253,10 @@ function DeviceRowView({ device, monitoring, getToken, onChanged }: { device: De
         ) : (
           <Badge variant="secondary">not monitored</Badge>
         )}
+        {paired && !pausedActive && (() => {
+          const health = deviceHealth(device);
+          return <Badge variant={health.variant}>{health.label}</Badge>;
+        })()}
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <Input className="w-20" type="number" min={1} value={minutes} onChange={(e) => setMinutes(e.target.value)} aria-label="Pause minutes" />
