@@ -24,24 +24,20 @@ the product must be able to explain *why it acted* without becoming a surveillan
   OCR text bodies, raw LLM responses, full DOM samples.
 - Always log: request/household/child/device/event/job ids, action, reason class, timings,
   confidence. That is enough to debug the pipeline without replaying a child's browsing.
-- **Change required on dev:** `activity_logger.log_step` currently persists whole event
-  payloads (DOM samples) and `llm_judge` persists `llm_raw_response` (2000 chars of model
-  output) to `logs/`. Both must be reduced to metadata (ids, lengths, hashes) or gated behind
-  an explicit `WATCHIT_AGENT_TRACE_FILES`-style debug flag that is **off by default** and
-  documented as dev-only.
-- Repo hygiene: `screenshots/**` metadata files are committed to git today — remove and
-  gitignore.
+- **Status:** activity-log persistence (`log_step`, raw LLM captures) is gated behind
+  `WATCHIT_AGENT_TRACE_FILES` (off by default, dev-only). `llm_judge` structlog output
+  carries `raw_len` only — never raw model text. `screenshots/` and `logs/` are gitignored.
 
-### Retention (targets)
-| Data | Default retention | Mechanism |
+### Retention (implemented — `db.run_retention_sweep`, hourly in the worker, `WATCHIT_RETENTION_SWEEP_ENABLED`)
+| Data | Retention | Mechanism |
 | --- | --- | --- |
-| Events (URL/title/domain) | 90 days | periodic sweep by `ts` |
-| DOM samples inside `events.data_json` | 7 days (strip field, keep row) | sweep |
-| `event_jobs` completed/failed rows | 14 days | sweep |
-| Decisions/analysis | 12 months (guardian-facing history) | sweep |
-| Screenshots + `ocr_text` | 30 days (`retention_expires_at`) | sweep + guardian delete |
+| DOM samples inside `events.data_json`/`raw_json` | 7 days (strip field, keep row) | sweep |
+| `event_jobs` completed/failed rows (full payload copies) | 14 days | sweep |
+| Screenshots + `ocr_text` | 30 days (`retention_expires_at`, stamped at insert) | sweep |
+| Events + decisions/analysis/overrides | 12 months, one window — decisions cascade from events (`ON DELETE CASCADE`), so the original 90-day URL target applies only once decisions are self-contained | sweep |
 | Audit log | 24 months | sweep |
-| Activity trace logs | dev-only, 7 days | logrotate / flag off in prod |
+| Expired `url_decision_cache` rows | on expiry | sweep |
+| Activity trace logs | dev-only (`WATCHIT_AGENT_TRACE_FILES` off by default) | flag |
 
 Sweeps run in the worker on a timer (same process as the queue consumer; no new deployable).
 

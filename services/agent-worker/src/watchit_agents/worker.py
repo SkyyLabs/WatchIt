@@ -18,11 +18,13 @@ class AgentWorker:
     """Consumes queued browser events and runs the safety pipeline."""
 
     REAP_INTERVAL_SECONDS = 60.0
+    RETENTION_INTERVAL_SECONDS = 3600.0
 
     def __init__(self, poll_interval: float | None = None, batch_size: int = 5):
         self.poll_interval = poll_interval if poll_interval is not None else settings.agent_worker_poll_interval
         self.batch_size = batch_size
         self._last_reap = 0.0
+        self._last_retention_sweep = 0.0
 
     async def run_forever(self) -> None:
         bind_log_context(service="agent-worker")
@@ -32,6 +34,7 @@ class AgentWorker:
         while True:
             try:
                 self.maybe_reap_stale_jobs()
+                self.maybe_run_retention_sweep()
                 await self.process_once()
             except asyncio.CancelledError:
                 logger.info("agent_worker_cancelled")
@@ -50,6 +53,20 @@ class AgentWorker:
         counts = db.reap_stale_event_jobs()
         if counts["requeued"] or counts["dead_lettered"]:
             logger.warning("stale_event_jobs_reaped", **counts)
+
+    def maybe_run_retention_sweep(self) -> None:
+        # Privacy retention sweep (docs/PRIVACY_LOGGING_AND_RETENTION.md): strips
+        # aged DOM samples, purges finished jobs, expired screenshots, old events
+        # and audit rows. Hourly; runs in the worker so there is no new deployable.
+        if not settings.retention_sweep_enabled:
+            return
+        now = time.monotonic()
+        if now - self._last_retention_sweep < self.RETENTION_INTERVAL_SECONDS:
+            return
+        self._last_retention_sweep = now
+        counts = db.run_retention_sweep()
+        if any(counts.values()):
+            logger.info("retention_sweep_completed", **counts)
 
     async def process_once(self) -> int:
         claim_started = time.perf_counter()

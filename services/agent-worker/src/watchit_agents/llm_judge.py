@@ -140,7 +140,9 @@ class LLMJudge:
             resp = self.client.invoke(msgs)
             llm_duration_ms = round((time.perf_counter() - llm_started) * 1000, 2)
             raw = resp.content.strip()
-            self.logger.debug("llm_raw_response", raw=raw[:2000], llm_duration_ms=llm_duration_ms)
+            # Privacy: never put raw model output in structlog — it can quote the
+            # child's page content. Full text goes only to the flag-gated trace log.
+            self.logger.debug("llm_response_received", raw_len=len(raw), llm_duration_ms=llm_duration_ms)
             # Also capture raw responses in the session log for audit/debug.
             activity_logger.log_service_event(
                 "llm_raw_response",
