@@ -9,7 +9,7 @@ from watchit_core.activity_logger import log_step, log_service_event
 from watchit_core.logging import bind_log_context, get_logger
 from watchit_core.url_cache import url_cache_key
 from watchit_agents.graph import app_graph, MonitorState
-from watchit_core.policy.engine import PolicyEngine
+from watchit_core.policy.engine import PolicyEngine, _in_quiet_hours, _schedule_now
 from watchit_core.screenshot_store import persist_screenshots_async
 
 class DecisionBus:
@@ -289,8 +289,60 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
         logger.debug("pipeline_timing", cache_hit=False, paused=True, pipeline_duration_ms=pipeline_duration_ms, db_event_write_ms=db_event_write_ms, pause_check_ms=pause_check_ms, decision_write_ms=decision_write_ms, publish_ms=publish_ms)
         return message
 
-    profile_started = time.perf_counter()
+    # Quiet-hours gate: a per-child window (or per-device override) blocks all
+    # browsing except the parent dashboard, which never routes through the
+    # extension. Device override wins over the child default (resolved in db).
     child_id = event.get("child_id")
+    quiet_schedules = (
+        db.get_effective_quiet_schedules(household_id, child_id, event.get("device_id"))
+        if child_id
+        else []
+    )
+    active_schedule = None
+    for schedule in quiet_schedules:
+        sched_now = _schedule_now({"timezone": schedule.get("timezone")})
+        quiet_spec = f"{schedule['quiet_start']}-{schedule['quiet_end']}"
+        if _in_quiet_hours(sched_now, schedule.get("days") or "", quiet_spec):
+            active_schedule = schedule
+            break
+    if active_schedule:
+        log_service_event(
+            "pipeline_bypassed_quiet_hours",
+            {"event_id": event_id, "child_id": child_id, "schedule_id": active_schedule.get("id")},
+        )
+        logger.debug("pipeline_bypassed_quiet_hours", schedule_id=active_schedule.get("id"))
+        log_step("event_received", event, {"upgrade": upgrade, "quiet_hours": True})
+        decision = {"action": "block", "reason": "quiet hours", "categories": ["schedule"]}
+        confidence = 1.0
+        decision_id = db.add_decision(
+            event_id,
+            settings.policy_version,
+            decision["action"],
+            decision["reason"],
+            {"categories": decision["categories"], "confidence": confidence},
+        )
+        message = _format_decision_message(
+            decision_id, event, decision, confidence=confidence,
+            need_screenshot=False, headline_result=None, llm_rationale=None,
+        )
+        message["upgrade"] = bool(upgrade)
+        log_step("decision_finalized", event, {"decision": decision, "confidence": confidence, "headline_agent": None})
+        await bus.publish(message)
+        _log_decision(
+            url=event.get("url"),
+            action=decision["action"],
+            decided_by="quiet_hours",
+            detail=decision["reason"],
+            rationale=None,
+            household_id=household_id,
+            child_id=child_id,
+            needs_ocr=False,
+            confidence=confidence,
+            decision_id=decision_id,
+        )
+        return message
+
+    profile_started = time.perf_counter()
     profile = db.get_child_profile(child_id, household_id) if child_id else None
     if not profile and child_id:
         db.add_child_profile(child_id, household_id=household_id)
