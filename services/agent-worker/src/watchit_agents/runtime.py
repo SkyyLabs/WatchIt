@@ -10,6 +10,7 @@ from watchit_core.logging import bind_log_context, get_logger
 from watchit_core.url_cache import url_cache_key
 from watchit_agents.graph import app_graph, MonitorState
 from watchit_core.policy.engine import PolicyEngine, _in_quiet_hours, _schedule_now
+from watchit_core.policy.rules import evaluate_rules
 from watchit_core.screenshot_store import persist_screenshots_async
 
 class DecisionBus:
@@ -332,6 +333,46 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
             url=event.get("url"),
             action=decision["action"],
             decided_by="quiet_hours",
+            detail=decision["reason"],
+            rationale=None,
+            household_id=household_id,
+            child_id=child_id,
+            needs_ocr=False,
+            confidence=confidence,
+            decision_id=decision_id,
+        )
+        return message
+
+    # Guardian manual rules: authoritative server-side pass of the same rules the
+    # extension enforces locally. Beats the URL decision cache so a fresh guardian
+    # rule always overrides a stale cached LLM decision.
+    manual_rules = db.list_active_rules(household_id, child_id, event.get("device_id"))
+    winning_rule = evaluate_rules(manual_rules, event.get("url")) if manual_rules else None
+    if winning_rule:
+        decision = {
+            "action": winning_rule["action"],
+            "reason": f"manual_rule:{winning_rule['id']}",
+            "categories": ["manual_rule"],
+        }
+        confidence = 1.0
+        decision_id = db.add_decision(
+            event_id,
+            settings.policy_version,
+            decision["action"],
+            decision["reason"],
+            {"categories": decision["categories"], "confidence": confidence, "rule_id": winning_rule["id"], "rule_pattern": winning_rule.get("pattern")},
+        )
+        message = _format_decision_message(
+            decision_id, event, decision, confidence=confidence,
+            need_screenshot=False, headline_result=None, llm_rationale=None,
+        )
+        message["upgrade"] = bool(upgrade)
+        log_step("decision_finalized", event, {"decision": decision, "confidence": confidence, "headline_agent": None})
+        await bus.publish(message)
+        _log_decision(
+            url=event.get("url"),
+            action=decision["action"],
+            decided_by="rule",
             detail=decision["reason"],
             rationale=None,
             household_id=household_id,

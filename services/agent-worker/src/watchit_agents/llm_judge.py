@@ -147,22 +147,25 @@ class LLMJudge:
                 {"model": self.model, "raw": raw[:2000]},
             )
         except Exception as e:
+            # Risk-tiered failure policy: a judge outage must never silently become
+            # unrestricted browsing. warn ⇒ blur + banner; low confidence keeps it
+            # out of the URL decision cache and escalates to OCR where enabled.
             self.logger.exception("llm_call_failed", provider=settings.llm_provider, model=self.model)
             return {
                 "is_harmful": False,
-                "categories": [],
-                "severity": "low",
+                "categories": ["system_uncertain"],
+                "severity": "medium",
                 "rationale": f"LLM call failed: {e}",
-                "action": "allow",
+                "action": "warn",
                 "confidence": 0.0,
             }
 
-        fallback_allow = {
+        fallback_uncertain = {
             "is_harmful": False,
-            "categories": ["llm_parse_error"],
-            "severity": "low",
-            "rationale": "LLM output invalid; defaulting to allow.",
-            "action": "allow",
+            "categories": ["system_uncertain", "llm_parse_error"],
+            "severity": "medium",
+            "rationale": "LLM output invalid; degrading to warn.",
+            "action": "warn",
             "confidence": 0.2,
         }
 
@@ -177,10 +180,10 @@ class LLMJudge:
                     data = json.loads(m.group(0))
                 except Exception as inner_e:
                     self.logger.error("llm_json_fallback_parse_failed", error=str(inner_e))
-                    return fallback_allow
+                    return fallback_uncertain
             else:
                 self.logger.error("llm_json_object_missing")
-                return fallback_allow
+                return fallback_uncertain
 
         # Validate with Pydantic
         try:
@@ -195,4 +198,4 @@ class LLMJudge:
             return result
         except Exception as e:
             self.logger.error("llm_validation_failed", error=str(e), data=data)
-            return fallback_allow
+            return fallback_uncertain

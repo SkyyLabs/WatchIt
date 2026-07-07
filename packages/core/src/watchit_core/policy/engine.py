@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 from datetime import datetime, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from watchit_core.config import settings
+from watchit_core.policy.rules import domain_suffix_match
 
 def _parse_time_range(spec: str) -> tuple[time, time]:
     # "21:00-07:00"
@@ -61,14 +62,15 @@ class PolicyEngine:
         url = event.get("url") or ""
         domain = (urlparse(url).netloc or "").lower()
 
-        # allowlist first
+        # allowlist first (exact-suffix match — "wikipedia.org" matches itself and
+        # subdomains, never "evilwikipedia.org"; ".edu" never matches "*.education")
         for a in self.allow_domains:
-            if a in domain:
+            if domain_suffix_match(domain, a):
                 return {"action":"allow","reason":f"allowlist {a}","categories":[]}
 
         # hard blocklist next
         for b in self.block_domains:
-            if b in domain:
+            if domain_suffix_match(domain, b):
                 return {"action":"block","reason":f"blocklist {b}","categories":["adult"]}
 
         # deterministic thresholds
@@ -93,6 +95,10 @@ class PolicyEngine:
 
         # LLM judge
         if judge_json:
+            # LLM failure / invalid output: never allow, never hard-block the whole
+            # web — degrade visibly (warn ⇒ blur + banner in the extension).
+            if "system_uncertain" in (judge_json.get("categories") or []):
+                return {"action":"warn","reason":"system_uncertain","categories":judge_json.get("categories",[])}
             act = judge_json.get("action","allow")
             # allow/block/blur pass through; warn/notify are not enforced yet, so
             # anything else escalates to block.

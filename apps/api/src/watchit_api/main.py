@@ -227,8 +227,16 @@ async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
 
 @app.post("/v1/event/upgrade")
 async def post_event_upgrade(evt: UpgradeInput, device_ctx=Depends(require_device)):
+    device = device_ctx["device"]
+    # An upgrade names an existing event id; it must belong to this device's
+    # household or a hostile device could rewrite another family's events.
+    owner_household = db.get_event_household(evt.id)
+    if owner_household is None:
+        raise HTTPException(404, "event not found")
+    if owner_household != device["household_id"]:
+        logger.warning("event_upgrade_cross_household_rejected", event_id=evt.id)
+        raise HTTPException(403, "event does not belong to this device's household")
     try:
-        device = device_ctx["device"]
         event = evt.model_dump()
         event["household_id"] = device["household_id"]
         event["child_id"] = device["child_id"]
@@ -286,11 +294,11 @@ async def stream_decisions(guardian_ctx=Depends(require_guardian_stream)):
 @app.get("/v1/device/stream/decisions")
 async def stream_device_decisions(device_ctx=Depends(require_device_stream)):
     from watchit_api.sse import sse_generator
-    household_id = device_ctx["device"]["household_id"]
+    device = device_ctx["device"]
     q = bus.subscribe()
     logger.info("device_decision_stream_subscribed")
     return StreamingResponse(
-        sse_generator(q, household_id=household_id),
+        sse_generator(q, household_id=device["household_id"], device_id=device["id"]),
         media_type="text/event-stream",
         background=BackgroundTask(bus.unsubscribe, q),
     )
@@ -587,8 +595,39 @@ async def create_pairing_code(payload: PairingCodePayload, guardian_ctx=Depends(
     db.log_audit(household_id, "device_pairing_code_created", guardian_id=guardian_id, entity_type="child", entity_id=payload.child_id)
     return {"pairing_code": pairing}
 
+# /v1/device/redeem is unauthenticated (the code is the secret) and the code
+# space is 10^6, so brute force must be throttled. In-process sliding window —
+# adequate for the current single-instance API; move to a shared store before
+# scaling out.
+from collections import deque
+
+_REDEEM_WINDOW_SECONDS = 60
+_REDEEM_MAX_PER_IP = 10
+_REDEEM_MAX_GLOBAL = 100
+_redeem_by_ip: dict[str, deque] = {}
+_redeem_global: deque = deque()
+
+
+def _redeem_allowed(client_ip: str, now: float | None = None) -> bool:
+    now = now if now is not None else time.monotonic()
+    cutoff = now - _REDEEM_WINDOW_SECONDS
+    per_ip = _redeem_by_ip.setdefault(client_ip, deque())
+    for window in (per_ip, _redeem_global):
+        while window and window[0] < cutoff:
+            window.popleft()
+    if len(per_ip) >= _REDEEM_MAX_PER_IP or len(_redeem_global) >= _REDEEM_MAX_GLOBAL:
+        return False
+    per_ip.append(now)
+    _redeem_global.append(now)
+    return True
+
+
 @app.post("/v1/device/redeem")
-async def redeem_pairing_code(payload: PairingRedeemPayload):
+async def redeem_pairing_code(payload: PairingRedeemPayload, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not _redeem_allowed(client_ip):
+        logger.warning("device_redeem_throttled")
+        raise HTTPException(429, "too many pairing attempts, try again later")
     result = db.redeem_pairing_code(
         payload.code,
         install_id=payload.install_id,
@@ -598,6 +637,7 @@ async def redeem_pairing_code(payload: PairingRedeemPayload):
         extension_version=payload.extension_version or "",
     )
     if not result:
+        logger.warning("device_redeem_failed")
         raise HTTPException(400, "invalid or expired pairing code")
     device = result["device"]
     db.log_audit(device["household_id"], "device_paired", device_id=device["id"], entity_type="device", entity_id=device["id"])
@@ -610,6 +650,104 @@ async def redeem_pairing_code(payload: PairingRedeemPayload):
             db.log_audit(reassigned["to_household_id"], "device_reassigned", device_id=device["id"], entity_type="device", entity_id=device["id"], metadata=reassigned)
         logger.info("device_reassigned", device_id=device["id"], from_child_id=reassigned["from_child_id"], to_child_id=reassigned["to_child_id"])
     return {"device": device, "device_token": result["device_token"]}
+
+@app.post("/v1/device/token/rotate")
+async def rotate_device_token(device_ctx=Depends(require_device)):
+    device = device_ctx["device"]
+    rotated = db.rotate_device_token(device["id"])
+    if not rotated:
+        raise HTTPException(409, "device is not active")
+    updated, new_token = rotated
+    db.log_audit(device["household_id"], "device_token_rotated", device_id=device["id"], entity_type="device", entity_id=device["id"])
+    logger.info("device_token_rotated", device_id=device["id"])
+    expires = updated.get("token_expires_at")
+    return {
+        "device_token": new_token,
+        "token_expires_at": int(expires.timestamp() * 1000) if expires else None,
+    }
+
+
+@app.get("/v1/device/policy")
+def get_device_policy(device_ctx=Depends(require_device)):
+    device = device_ctx["device"]
+    snapshot = db.build_policy_snapshot(device)
+    db.stamp_policy_fetch(device["id"])
+    logger.info("device_policy_snapshot_served", snapshot_version=snapshot["version"])
+    return {"snapshot": snapshot}
+
+
+class RuleCreatePayload(BaseModel):
+    action: Literal["allow", "block"]
+    rule_type: Literal["domain", "url", "prefix"]
+    pattern: str
+    child_id: Optional[str] = None
+    device_id: Optional[str] = None
+    reason: Optional[str] = None
+    expires_in_days: Optional[int] = None
+
+
+@app.get("/v1/rules")
+def list_rules(child_id: str | None = None, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    return {"rules": db.list_rules(household_id, child_id)}
+
+
+@app.post("/v1/rules")
+async def create_rule(payload: RuleCreatePayload, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    pattern = payload.pattern.strip()
+    if not pattern:
+        raise HTTPException(400, "pattern is required")
+    if payload.rule_type == "domain":
+        # Store bare lowercase hosts; accept pasted URLs for convenience.
+        pattern = pattern.lower()
+        if "//" in pattern:
+            pattern = pattern.split("//", 1)[1]
+        pattern = pattern.split("/", 1)[0].split(":")[0]
+        if pattern.startswith("www."):
+            pattern = pattern[4:]
+        if not pattern or "." not in pattern:
+            raise HTTPException(400, "pattern must be a domain")
+    if payload.child_id and not db.get_child_profile(payload.child_id, household_id):
+        raise HTTPException(404, "child not found")
+    if payload.device_id:
+        if not payload.child_id:
+            raise HTTPException(400, "device-scoped rules need child_id")
+        if not any(d["id"] == payload.device_id for d in db.fetch_devices(household_id, payload.child_id)):
+            raise HTTPException(404, "device not found")
+    expires_at = None
+    if payload.expires_in_days is not None:
+        if payload.expires_in_days <= 0:
+            raise HTTPException(400, "expires_in_days must be positive")
+        from datetime import datetime, timedelta, timezone as tz
+        expires_at = datetime.now(tz.utc) + timedelta(days=payload.expires_in_days)
+    rule = db.create_rule(
+        household_id,
+        action=payload.action,
+        rule_type=payload.rule_type,
+        pattern=pattern,
+        child_id=payload.child_id,
+        device_id=payload.device_id,
+        reason=payload.reason,
+        expires_at=expires_at,
+        created_by_guardian_id=guardian_id,
+    )
+    db.log_audit(household_id, "rule_created", guardian_id=guardian_id, entity_type="policy_rule", entity_id=rule["id"], metadata={"action": payload.action, "rule_type": payload.rule_type, "pattern": pattern, "child_id": payload.child_id, "device_id": payload.device_id})
+    logger.info("rule_created", rule_id=rule["id"], action=payload.action, rule_type=payload.rule_type)
+    return {"rule": rule}
+
+
+@app.delete("/v1/rules/{rule_id}")
+async def delete_rule(rule_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if db.delete_rule(rule_id, household_id) == 0:
+        raise HTTPException(404, "rule not found")
+    db.log_audit(household_id, "rule_deleted", guardian_id=guardian_id, entity_type="policy_rule", entity_id=rule_id)
+    logger.info("rule_deleted", rule_id=rule_id)
+    return {"ok": True}
+
 
 @app.patch("/v1/devices/{device_id}")
 async def patch_device(device_id: str, body: DevicePatchPayload, guardian_ctx=Depends(require_guardian)):
