@@ -211,6 +211,16 @@ class Database:
                 "UPDATE monitoring_sessions SET household_id=%s WHERE child_id=%s AND household_id=%s",
                 (to_household_id, child_id, from_household_id),
             )
+            # Outstanding (unredeemed) pairing codes carry the source household_id;
+            # redeem_pairing_code trusts it, so move them too or a pre-move code would
+            # pair the child's browser back into the old household.
+            cur.execute(
+                """
+                UPDATE device_pairing_codes SET household_id=%s
+                WHERE child_id=%s AND household_id=%s AND redeemed_at IS NULL
+                """,
+                (to_household_id, child_id, from_household_id),
+            )
             return True
 
     def log_audit(
