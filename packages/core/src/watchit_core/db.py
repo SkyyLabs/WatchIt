@@ -415,26 +415,37 @@ class Database:
             )
             return cur.rowcount
 
-    def get_effective_quiet_schedule(
+    def get_effective_quiet_schedules(
         self, household_id: str, child_id: str, device_id: Optional[str] = None
-    ) -> Optional[Dict[str, Any]]:
-        # Device-level override wins; otherwise fall back to the child-level default.
+    ) -> List[Dict[str, Any]]:
+        # Return every enabled window that applies, so the caller can match any of
+        # them (a child may have e.g. separate weekday/weekend windows). Device-level
+        # windows override the child defaults entirely when present. timezone falls
+        # back to the child profile's timezone so windows evaluate in local time.
+        cols = (
+            "cs.id, cs.household_id, cs.child_id, cs.device_id, cs.name, cs.days, "
+            "to_char(cs.quiet_start, 'HH24:MI') AS quiet_start, "
+            "to_char(cs.quiet_end, 'HH24:MI') AS quiet_end, "
+            "COALESCE(NULLIF(cs.timezone, ''), NULLIF(c.timezone, '')) AS timezone, cs.enabled"
+        )
+        base = (
+            f"SELECT {cols} FROM child_schedules cs JOIN children c ON c.id=cs.child_id "
+            "WHERE cs.household_id=%s AND cs.child_id=%s AND cs.enabled=TRUE"
+        )
         with self._connect() as conn, conn.cursor() as cur:
             if device_id:
                 cur.execute(
-                    f"SELECT {self._SCHEDULE_COLUMNS} FROM child_schedules "
-                    "WHERE household_id=%s AND child_id=%s AND device_id=%s AND enabled=TRUE LIMIT 1",
+                    base + " AND cs.device_id=%s ORDER BY cs.created_at ASC",
                     (household_id, child_id, device_id),
                 )
-                row = cur.fetchone()
-                if row:
-                    return row
+                rows = cur.fetchall()
+                if rows:
+                    return rows
             cur.execute(
-                f"SELECT {self._SCHEDULE_COLUMNS} FROM child_schedules "
-                "WHERE household_id=%s AND child_id=%s AND device_id IS NULL AND enabled=TRUE LIMIT 1",
+                base + " AND cs.device_id IS NULL ORDER BY cs.created_at ASC",
                 (household_id, child_id),
             )
-            return cur.fetchone()
+            return cur.fetchall()
 
     def fetch_devices(self, household_id: str, child_id: str) -> List[Dict[str, Any]]:
         with self._connect() as conn, conn.cursor() as cur:
