@@ -53,6 +53,18 @@ SYSTEM_PROMPT_TEMPLATE = (
     '"action": "block", "confidence": 0.95}}'
 )
 
+def _image_block(b64: str) -> Dict[str, Any]:
+    # Extension screenshots arrive as raw base64 (data-URL prefix stripped);
+    # sniff the format from the base64 magic bytes.
+    if b64.startswith("data:"):
+        url = b64
+    elif b64.startswith("/9j/"):
+        url = f"data:image/jpeg;base64,{b64}"
+    else:
+        url = f"data:image/png;base64,{b64}"
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 def build_human_prompt(page_title: str, domain: str, fast_scores: Dict[str, float], text_sample: str, child_age: int, strictness: str) -> str:
     # Keep payload compact (cap text to ~2000 chars) and render scores as JSON so
     # the model reads clean key/value pairs rather than a Python dict repr.
@@ -111,6 +123,7 @@ class LLMJudge:
         text_sample: str,
         child_age: int,
         strictness: str,
+        images_b64: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         if strictness not in {"lenient", "standard", "strict"}:
             strictness = "standard"
@@ -124,7 +137,16 @@ class LLMJudge:
         guardian_guidance = self._guardian_guidance()
         if guardian_guidance:
             system_prompt += "\nGuardian feedback to prioritize:\n" + guardian_guidance
-        msgs = [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
+        if images_b64:
+            # Multimodal path: the judge sees the screenshot directly — no OCR
+            # hop. Same JSON contract; the image is just another signal.
+            content: List[Dict[str, Any]] = [
+                {"type": "text", "text": prompt + "\nSCREENSHOTS of the visible page are attached."}
+            ]
+            content.extend(_image_block(b64) for b64 in images_b64[:3])
+            msgs = [SystemMessage(content=system_prompt), HumanMessage(content=content)]
+        else:
+            msgs = [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
 
         # Send to Ollama
         try:

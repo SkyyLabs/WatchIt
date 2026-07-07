@@ -28,6 +28,7 @@ class URLMetadataAgent:
         child_profile: Dict[str, Any],
         extra_text: str = "",
         fast_scores: Dict[str, float] | None = None,
+        images_b64: list[str] | None = None,
     ) -> URLAgentResult:
         if fast_scores is None:
             fast_scores = self.analyzer.analyze_event_fast(event, extra_text=extra_text)
@@ -43,6 +44,7 @@ class URLMetadataAgent:
             text_sample=self._aggregate_text(event, extra_text),
             child_age=child_age,
             strictness=strictness,
+            images_b64=images_b64,
         )
         confidence = float(llm_decision.get("confidence", 0.5))
         return URLAgentResult(
