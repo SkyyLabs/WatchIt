@@ -44,7 +44,7 @@ import {
   TimeRange,
 } from "@/lib/dashboard-model";
 import type { DashboardView as DashboardRouteView } from "@/lib/dashboard-model";
-import { displayAction, displayReason, domainFromUrl, formatCountdown, formatDateTime, formatTime } from "@/lib/format";
+import { decidedBy, displayAction, displayReason, domainFromUrl, formatCountdown, formatDateTime, formatTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -53,6 +53,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ChildrenView } from "@/components/dashboard/children-view";
 import { HouseholdView } from "@/components/dashboard/household-view";
+import { ProtectionStatus } from "@/components/dashboard/protection-status";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -728,6 +729,7 @@ function HomeDashboardView(props: {
   }
   return (
     <div className="space-y-6">
+      <ProtectionStatus />
       <SafetyOverview metrics={props.metrics} />
       <div className="grid gap-6 xl:grid-cols-[1.35fr_.85fr]">
         <AttentionNeeded
@@ -941,6 +943,9 @@ function ActivityTimeline({ decisions, events }: { decisions: DecisionRecord[]; 
                   <Badge variant={decision?.action === "allow" || !decision ? "secondary" : "default"}>
                     {decision ? displayAction(decision.action) : "Visit"}
                   </Badge>
+                  {decision && decidedBy(decision.reason) && (
+                    <Badge variant="outline">{decidedBy(decision.reason)}</Badge>
+                  )}
                   {decision?.manual_flagged && <Badge variant="outline">Parent changed</Badge>}
                   <span className="text-xs text-muted-foreground">{formatTime(event.ts || decision?.ts)}</span>
                 </div>

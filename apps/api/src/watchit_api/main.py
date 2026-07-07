@@ -207,9 +207,11 @@ async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
         event["household_id"] = device["household_id"]
         event["child_id"] = device["child_id"]
         event["device_id"] = device["id"]
-        session = db.get_active_monitoring_session(device["household_id"], device["child_id"], device["id"])
+        # Protection by default: a paired device is monitored unless a guardian
+        # explicitly stopped this child. 409 only reflects that explicit stop.
+        session = db.ensure_monitoring_session(device["household_id"], device["child_id"], device["id"])
         if not session:
-            logger.info("event_ignored_no_active_session", child_id=device["child_id"], device_id=device["id"])
+            logger.info("event_ignored_guardian_stopped", child_id=device["child_id"], device_id=device["id"])
             raise HTTPException(409, "monitoring is not active for this device")
         event["session_id"] = session["id"]
         # Snapshot the household monitoring switch at browse time so a toggle after
@@ -221,6 +223,8 @@ async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
         job_id, event_id = db.enqueue_event_job(event, upgrade=False)
         logger.info("event_queued", job_id=job_id, event_id=event_id, child_id=event.get("child_id"), upgrade=False)
         return {"status": "queued", "job_id": job_id, "event_id": event_id, "action": "pending", "needs_ocr": False}
+    except HTTPException:
+        raise  # deliberate statuses (409 guardian-stopped) must not become 500s
     except Exception:
         logger.exception("event_enqueue_failed")
         raise HTTPException(500, "internal error")
@@ -241,9 +245,9 @@ async def post_event_upgrade(evt: UpgradeInput, device_ctx=Depends(require_devic
         event["household_id"] = device["household_id"]
         event["child_id"] = device["child_id"]
         event["device_id"] = device["id"]
-        session = db.get_active_monitoring_session(device["household_id"], device["child_id"], device["id"])
+        session = db.ensure_monitoring_session(device["household_id"], device["child_id"], device["id"])
         if not session:
-            logger.info("event_upgrade_ignored_no_active_session", child_id=device["child_id"], device_id=device["id"])
+            logger.info("event_upgrade_ignored_guardian_stopped", child_id=device["child_id"], device_id=device["id"])
             raise HTTPException(409, "monitoring is not active for this device")
         event["session_id"] = session["id"]
         event["monitoring_enabled"] = db.is_household_monitoring_enabled(device["household_id"])
@@ -253,6 +257,8 @@ async def post_event_upgrade(evt: UpgradeInput, device_ctx=Depends(require_devic
         job_id, event_id = db.enqueue_event_job(event, upgrade=True)
         logger.info("event_queued", job_id=job_id, event_id=event_id, child_id=event.get("child_id"), upgrade=True)
         return {"status": "queued", "job_id": job_id, "event_id": event_id, "action": "pending", "needs_ocr": False}
+    except HTTPException:
+        raise  # deliberate statuses (409 guardian-stopped) must not become 500s
     except Exception:
         logger.exception("event_upgrade_enqueue_failed")
         raise HTTPException(500, "internal error")
@@ -302,6 +308,33 @@ async def stream_device_decisions(device_ctx=Depends(require_device_stream)):
         media_type="text/event-stream",
         background=BackgroundTask(bus.unsubscribe, q),
     )
+
+@app.get("/healthz")
+def healthz():
+    # Unauthenticated liveness/readiness for deploy probes. Boolean health only —
+    # no counts or ids leak to unauthenticated callers.
+    try:
+        db.ping()
+        return {"ok": True}
+    except Exception:
+        logger.exception("healthz_db_check_failed")
+        raise HTTPException(503, "database unavailable")
+
+
+@app.get("/v1/queue/stats")
+def get_queue_stats(guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    return {
+        "queue": db.get_queue_stats(household_id),
+        "failed_jobs": db.list_failed_event_jobs(household_id),
+    }
+
+
+@app.get("/v1/devices")
+def list_household_devices(guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    return {"devices": db.fetch_household_devices(household_id)}
+
 
 @app.get("/v1/settings/security")
 def get_security_settings(guardian_ctx=Depends(require_guardian)):
@@ -641,6 +674,9 @@ async def redeem_pairing_code(payload: PairingRedeemPayload, request: Request):
         raise HTTPException(400, "invalid or expired pairing code")
     device = result["device"]
     db.log_audit(device["household_id"], "device_paired", device_id=device["id"], entity_type="device", entity_id=device["id"])
+    if result.get("session"):
+        db.log_audit(device["household_id"], "monitoring_autostarted", device_id=device["id"], entity_type="monitoring_session", entity_id=result["session"]["id"], metadata={"child_id": device["child_id"], "trigger": "device_paired"})
+        logger.info("monitoring_autostarted_on_pair", device_id=device["id"], session_id=result["session"]["id"])
     reassigned = result.get("reassigned")
     if reassigned:
         # Same install_id was stolen from another child: record it on both sides

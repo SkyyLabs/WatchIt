@@ -72,6 +72,11 @@ class Database:
         # `with self._connect() as conn` call sites as before.
         return self._get_pool().connection()
 
+    def ping(self) -> bool:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return True
+
     def close(self) -> None:
         if self._pool is not None:
             self._pool.close()
@@ -469,6 +474,23 @@ class Database:
             )
             return cur.fetchall()
 
+    def fetch_household_devices(self, household_id: str) -> List[Dict[str, Any]]:
+        # Household-wide device list (all children) for the dashboard's
+        # protection-status view; one query instead of per-child fetches.
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT d.id, d.child_id, c.name AS child_name, d.device_name, d.browser_name,
+                       d.status, d.last_seen_at, d.policy_fetched_at, d.paused_until, d.created_at
+                FROM devices d
+                JOIN children c ON c.id=d.child_id
+                WHERE d.household_id=%s AND d.status<>'revoked'
+                ORDER BY d.created_at DESC
+                """,
+                (household_id,),
+            )
+            return cur.fetchall()
+
     # --- Guardian manual allow/block rules --------------------------------------
 
     def create_rule(
@@ -768,6 +790,9 @@ class Database:
             )
         return job_id, event_id
 
+    MAX_JOB_ATTEMPTS = 3
+    STALE_JOB_SECONDS = 300
+
     def claim_event_jobs(self, limit: int = 5) -> List[Dict[str, Any]]:
         now_ms = int(time.time() * 1000)
         with self._connect() as conn, conn.cursor() as cur:
@@ -776,7 +801,7 @@ class Database:
                 WITH claimed AS (
                     SELECT id
                     FROM event_jobs
-                    WHERE status='pending'
+                    WHERE status='pending' AND attempts < %s
                     ORDER BY created_at ASC
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
@@ -789,7 +814,68 @@ class Database:
                 WHERE j.id=claimed.id
                 RETURNING j.*
                 """,
-                (limit, now_ms),
+                (self.MAX_JOB_ATTEMPTS, limit, now_ms),
+            )
+            return cur.fetchall()
+
+    def reap_stale_event_jobs(self) -> Dict[str, int]:
+        """Recover jobs orphaned by a worker crash mid-processing: requeue them
+        while attempts remain, dead-letter (status='failed') once exhausted.
+        Returns counts for logging."""
+        stale_before_ms = int(time.time() * 1000) - self.STALE_JOB_SECONDS * 1000
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE event_jobs
+                SET status='pending', claimed_at=NULL
+                WHERE status='processing' AND claimed_at < %s AND attempts < %s
+                """,
+                (stale_before_ms, self.MAX_JOB_ATTEMPTS),
+            )
+            requeued = cur.rowcount
+            cur.execute(
+                """
+                UPDATE event_jobs
+                SET status='failed', error='stale after max attempts'
+                WHERE status='processing' AND claimed_at < %s AND attempts >= %s
+                """,
+                (stale_before_ms, self.MAX_JOB_ATTEMPTS),
+            )
+            dead_lettered = cur.rowcount
+        return {"requeued": requeued, "dead_lettered": dead_lettered}
+
+    def get_queue_stats(self, household_id: str) -> Dict[str, Any]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status, COUNT(*) AS count, MIN(created_at) AS oldest_created_at
+                FROM event_jobs
+                WHERE household_id=%s AND status IN ('pending', 'processing', 'failed')
+                GROUP BY status
+                """,
+                (household_id,),
+            )
+            rows = {row["status"]: row for row in cur.fetchall()}
+        now_ms = int(time.time() * 1000)
+        pending = rows.get("pending")
+        return {
+            "pending": int((rows.get("pending") or {}).get("count") or 0),
+            "processing": int((rows.get("processing") or {}).get("count") or 0),
+            "failed": int((rows.get("failed") or {}).get("count") or 0),
+            "oldest_pending_age_ms": (now_ms - int(pending["oldest_created_at"])) if pending and pending.get("oldest_created_at") else None,
+        }
+
+    def list_failed_event_jobs(self, household_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, event_id, attempts, error, created_at
+                FROM event_jobs
+                WHERE household_id=%s AND status='failed'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (household_id, limit),
             )
             return cur.fetchall()
 
@@ -1358,7 +1444,31 @@ class Database:
                     "to_child_id": pairing["child_id"],
                     "to_household_id": pairing["household_id"],
                 }
-        return {"device": device, "device_token": device_token, "reassigned": reassigned}
+            # Protection by default: pairing implies monitoring. Start a session
+            # scoped to this device only — never touch the child's sessions on
+            # other devices. Pairing is an explicit guardian action (they minted
+            # the code), so this applies even after a previous guardian stop.
+            session_started = None
+            cur.execute(
+                """
+                SELECT id FROM monitoring_sessions
+                WHERE household_id=%s AND child_id=%s AND status='active'
+                  AND (device_id=%s OR device_id IS NULL)
+                LIMIT 1
+                """,
+                (pairing["household_id"], pairing["child_id"], device["id"]),
+            )
+            if not cur.fetchone():
+                cur.execute(
+                    """
+                    INSERT INTO monitoring_sessions(id, household_id, child_id, device_id, started_by_guardian_id, status)
+                    VALUES (%s, %s, %s, %s, %s, 'active')
+                    RETURNING *
+                    """,
+                    (self._new_id("sess"), pairing["household_id"], pairing["child_id"], device["id"], pairing.get("created_by_guardian_id")),
+                )
+                session_started = cur.fetchone()
+        return {"device": device, "device_token": device_token, "reassigned": reassigned, "session": session_started}
 
     def resolve_device_token(self, token: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Resolve a raw device token to (device, error).
@@ -1484,6 +1594,51 @@ class Database:
                     (guardian_id, reason, household_id),
                 )
             return cur.rowcount
+
+    def ensure_monitoring_session(
+        self,
+        household_id: str,
+        child_id: str,
+        device_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Protection by default: return the active session, auto-starting one
+        when none exists — unless the most recent session for this child was
+        explicitly stopped by a guardian (their off switch stays an off switch).
+        Auto-started sessions have no starting guardian and are audited."""
+        session = self.get_active_monitoring_session(household_id, child_id, device_id)
+        if session:
+            return session
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT stop_reason FROM monitoring_sessions
+                WHERE household_id=%s AND child_id=%s
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (household_id, child_id),
+            )
+            last = cur.fetchone()
+            if last and last.get("stop_reason") == "guardian_stopped":
+                return None
+            cur.execute(
+                """
+                INSERT INTO monitoring_sessions(id, household_id, child_id, device_id, status)
+                VALUES (%s, %s, %s, %s, 'active')
+                RETURNING *
+                """,
+                (self._new_id("sess"), household_id, child_id, device_id),
+            )
+            session = cur.fetchone()
+        self.log_audit(
+            household_id,
+            "monitoring_autostarted",
+            device_id=device_id,
+            entity_type="monitoring_session",
+            entity_id=session["id"],
+            metadata={"child_id": child_id},
+        )
+        return session
 
     def get_active_monitoring_session(
         self,
