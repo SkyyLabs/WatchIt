@@ -41,11 +41,20 @@ export function ChildrenView(props: Props) {
   );
 }
 
+function displayChildName(child: ChildProfile): string {
+  if (child.name && child.name.trim()) return child.name;
+  // Fall back to a readable name from the id (e.g. "child_sky_labs" -> "Sky Labs").
+  const slug = child.id.replace(/^child_/, "").replace(/[_-]+/g, " ").trim();
+  if (!slug) return child.id;
+  return slug.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
 function ChildCard({ child, getToken, onCreatePairingCode, onStartMonitoring, onStopMonitoring }: { child: ChildProfile } & Props) {
   const [code, setCode] = useState<string | null>(null);
   const [devices, setDevices] = useState<DeviceRow[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showDevices, setShowDevices] = useState(false);
   const [monitoring, setMonitoring] = useState<boolean>(Boolean(child.monitoring_active));
 
   // A device is "active" only while monitoring is running; stopping drops the count to 0.
@@ -84,16 +93,16 @@ function ChildCard({ child, getToken, onCreatePairingCode, onStartMonitoring, on
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-3">
-          {child.name}
+          {displayChildName(child)}
           <Badge variant="secondary">age {child.age}</Badge>
           <Badge>{child.strictness}</Badge>
           <span className="text-sm font-normal text-muted-foreground">
             Monitoring is{" "}
-            <strong className={monitoring ? "text-green-600 dark:text-green-500" : "text-foreground"}>
+            <strong className={monitoring ? "text-success" : "text-foreground"}>
               {monitoring ? "on" : "off"}
             </strong>
           </span>
-          <span className="ml-auto text-sm font-medium text-green-600 dark:text-green-500">
+          <span className="ml-auto text-sm font-medium text-success">
             Active Devices: {activeDevices}
           </span>
         </CardTitle>
@@ -103,15 +112,13 @@ function ChildCard({ child, getToken, onCreatePairingCode, onStartMonitoring, on
           <Button
             disabled={busy}
             variant={monitoring ? "outline" : "default"}
-            className={monitoring ? undefined : "bg-green-600 hover:bg-green-700 text-white"}
             onClick={() => run(() => onStartMonitoring(child.id), true)}
           >
             Start
           </Button>
           <Button
             disabled={busy}
-            variant={monitoring ? "default" : "outline"}
-            className={monitoring ? "bg-destructive hover:bg-destructive/90 text-white" : undefined}
+            variant={monitoring ? "destructive" : "outline"}
             onClick={() => run(() => onStopMonitoring(child.id), false)}
           >
             Stop
@@ -126,7 +133,19 @@ function ChildCard({ child, getToken, onCreatePairingCode, onStartMonitoring, on
           >
             Pair a device
           </Button>
-          <Button disabled={busy} variant="ghost" onClick={loadDevices}>View devices</Button>
+          <Button
+            disabled={busy}
+            variant="ghost"
+            onClick={() => {
+              setShowDevices((v) => {
+                const next = !v;
+                if (next && !devices) void loadDevices();
+                return next;
+              });
+            }}
+          >
+            {showDevices ? "Hide devices" : "View devices"}
+          </Button>
         </div>
 
         {code && (
@@ -137,7 +156,7 @@ function ChildCard({ child, getToken, onCreatePairingCode, onStartMonitoring, on
         )}
         {error && <p className="text-sm text-destructive">{error}</p>}
 
-        {devices && (
+        {showDevices && devices && (
           <div className="space-y-2">
             {devices.length === 0 && <p className="text-sm text-muted-foreground">No paired devices.</p>}
             {devices.map((d) => (
@@ -200,7 +219,7 @@ function DeviceRowView({ device, monitoring, getToken, onChanged }: { device: De
         <span className="font-medium">{device.device_name || device.browser_name || device.id}</span>
         <Badge variant="outline">{paired ? "paired" : device.status}</Badge>
         {monitoringNow ? (
-          <Badge className="bg-green-600 text-white hover:bg-green-600">monitoring</Badge>
+          <Badge variant="success">monitoring</Badge>
         ) : pausedActive ? (
           <Badge variant="secondary">paused</Badge>
         ) : (

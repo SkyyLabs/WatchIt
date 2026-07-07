@@ -18,7 +18,7 @@ export default function RootLayout({
 
   return (
     <ClerkProvider>
-      <html lang="en" className="dark font-sans">
+      <html lang="en" className="font-sans">
         <body className="antialiased">
           <TooltipProvider>
             <DashboardDataProvider>{children}</DashboardDataProvider>
