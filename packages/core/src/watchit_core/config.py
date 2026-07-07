@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     # Server
     bind_host: str = Field(default="127.0.0.1", alias="WATCHIT_BIND_HOST")
     bind_port: int = Field(default=4849, alias="WATCHIT_BIND_PORT")
+    # Comma-separated dashboard origins allowed by CORS (hosted deploys set this
+    # to the production dashboard URL).
+    cors_origins: str = Field(default="http://127.0.0.1:4848,http://localhost:4848", alias="WATCHIT_CORS_ORIGINS")
+
+    def cors_origin_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
     # Features
     log_level: str = Field(default="INFO", alias="WATCHIT_LOG_LEVEL")

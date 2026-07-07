@@ -1,4 +1,4 @@
-.PHONY: setup venv deps run run-api run-agent-worker run-dashboard start-ollama pull-model db-init test verify clean
+.PHONY: setup venv deps run run-api run-agent-worker run-dashboard start-ollama pull-model db-init test verify clean build-extension
 
 
 VENV=.venv
@@ -65,6 +65,12 @@ verify:
 		test "$$heads" -eq 1 || { echo "Expected exactly 1 Alembic head, found $$heads:"; PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/alembic heads; exit 1; }
 	PYTHONPATH=$(PYTHONPATH) $(VENV)/bin/pytest -q
 	cd apps/dashboard && npm run typecheck
+
+
+# Per-environment extension build: make build-extension EXT_API_BASE=https://api.example.com
+EXT_API_BASE=http://127.0.0.1:4849
+build-extension:
+	$(PY) scripts/build_extension.py --api-base $(EXT_API_BASE)
 
 
 clean:
