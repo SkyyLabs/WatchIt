@@ -7,6 +7,7 @@ import secrets
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -39,6 +40,13 @@ class Database:
     POLICY_SNAPSHOT_TTL_SECONDS = 86_400
     POLICY_SNAPSHOT_REFRESH_SECONDS = 900
     POLICY_SNAPSHOT_CACHE_LIMIT = 200
+    # Retention windows (docs/PRIVACY_LOGGING_AND_RETENTION.md). Events carry
+    # decisions/analysis via ON DELETE CASCADE, so they share one 12-month window.
+    RETENTION_DOM_SAMPLE_DAYS = 7
+    RETENTION_EVENT_JOBS_DAYS = 14
+    RETENTION_SCREENSHOTS_DAYS = 30
+    RETENTION_EVENTS_DAYS = 365
+    RETENTION_AUDIT_DAYS = 730
 
     def __init__(self, dsn: Optional[str] = None):
         self.dsn = dsn
@@ -104,6 +112,17 @@ class Database:
     @staticmethod
     def _token_hash(token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _strip_screenshot_bytes(payload: Any) -> Any:
+        # Invariant: image bytes never enter Postgres. The upgrade path carries
+        # base64 screenshots inside data_json for the worker; keep them in the
+        # transient queue payload only — the events row stores a count marker.
+        if isinstance(payload, dict) and "screenshots_b64" in payload:
+            payload = dict(payload)
+            shots = payload.pop("screenshots_b64")
+            payload["screenshot_count"] = len(shots) if isinstance(shots, list) else 1
+        return payload
 
     @staticmethod
     def _domain(url: str | None) -> str:
@@ -779,8 +798,8 @@ class Database:
                     event.get("title"),
                     event.get("tab_id"),
                     event.get("referrer"),
-                    Json(self._safe_json(event.get("data_json") or {})),
-                    Json(self._safe_json(event.get("data_json") or {})),
+                    Json(self._strip_screenshot_bytes(self._safe_json(event.get("data_json") or {}))),
+                    Json(self._strip_screenshot_bytes(self._safe_json(event.get("data_json") or {}))),
                 ),
             )
         return event_id
@@ -855,6 +874,79 @@ class Database:
             dead_lettered = cur.rowcount
         return {"requeued": requeued, "dead_lettered": dead_lettered}
 
+    def run_retention_sweep(self) -> Dict[str, int]:
+        """Periodic privacy sweep (targets in docs/PRIVACY_LOGGING_AND_RETENTION.md).
+
+        - DOM samples stripped from events after RETENTION_DOM_SAMPLE_DAYS (row kept).
+        - Finished event_jobs (whole browsing payload copies) purged after
+          RETENTION_EVENT_JOBS_DAYS.
+        - Screenshot files + ocr_text deleted after RETENTION_SCREENSHOTS_DAYS.
+        - Events deleted after RETENTION_EVENTS_DAYS; decisions/analysis/overrides
+          ride along via ON DELETE CASCADE (they reference the event's context, so
+          they cannot outlive it — the doc's separate 90-day URL target applies
+          once decisions are self-contained).
+        - Audit log and expired URL-cache rows purged last.
+        Runs household-wide by design: retention is a platform guarantee, not a
+        per-tenant query, and every deleted row is already past its window.
+        """
+        now_ms = int(time.time() * 1000)
+        day_ms = 86_400_000
+        counts: Dict[str, int] = {}
+        screenshot_paths: List[str] = []
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE events
+                SET data_json = (data_json - 'dom_sample') - 'screenshots_b64',
+                    raw_json = (raw_json - 'dom_sample') - 'screenshots_b64'
+                WHERE ts < %s
+                  AND (data_json ?| array['dom_sample','screenshots_b64']
+                       OR raw_json ?| array['dom_sample','screenshots_b64'])
+                """,
+                (now_ms - self.RETENTION_DOM_SAMPLE_DAYS * day_ms,),
+            )
+            counts["dom_samples_stripped"] = cur.rowcount
+            cur.execute(
+                "DELETE FROM event_jobs WHERE status IN ('completed','failed') AND created_at < %s",
+                (now_ms - self.RETENTION_EVENT_JOBS_DAYS * day_ms,),
+            )
+            counts["event_jobs_purged"] = cur.rowcount
+            cur.execute(
+                """
+                SELECT id, local_path FROM screenshot_files
+                WHERE COALESCE(retention_expires_at, captured_at + make_interval(days => %s)) < now()
+                """,
+                (self.RETENTION_SCREENSHOTS_DAYS,),
+            )
+            expired_shots = cur.fetchall()
+            if expired_shots:
+                cur.execute(
+                    "DELETE FROM screenshot_files WHERE id = ANY(%s)",
+                    ([row["id"] for row in expired_shots],),
+                )
+                screenshot_paths = [row["local_path"] for row in expired_shots if row.get("local_path")]
+            counts["screenshots_purged"] = len(expired_shots)
+            cur.execute(
+                "DELETE FROM events WHERE ts < %s",
+                (now_ms - self.RETENTION_EVENTS_DAYS * day_ms,),
+            )
+            counts["events_purged"] = cur.rowcount
+            cur.execute(
+                "DELETE FROM audit_log WHERE created_at < now() - make_interval(days => %s)",
+                (self.RETENTION_AUDIT_DAYS,),
+            )
+            counts["audit_purged"] = cur.rowcount
+            cur.execute("DELETE FROM url_decision_cache WHERE expires_at IS NOT NULL AND expires_at < now()")
+            counts["url_cache_purged"] = cur.rowcount
+        # Unlink files only after the rows are committed; a leftover file with no
+        # row is re-swept as untracked noise, a row with no file would 404 forever.
+        for path in screenshot_paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return counts
+
     def get_queue_stats(self, household_id: str) -> Dict[str, Any]:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -906,10 +998,11 @@ class Database:
             )
 
     def update_event_data_json(self, event_id: str, data_json: str):
+        stored = self._strip_screenshot_bytes(self._safe_json(data_json or {}))
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "UPDATE events SET data_json=%s, raw_json=%s WHERE id=%s",
-                (Json(self._safe_json(data_json or {})), Json(self._safe_json(data_json or {})), event_id),
+                (Json(stored), Json(stored), event_id),
             )
 
     def add_analysis(self, event_id: str, model: str, version: str, scores: Dict[str, Any], label: str = "", latency_ms: Optional[int] = None) -> str:
@@ -1743,11 +1836,11 @@ class Database:
             cur.execute(
                 """
                 INSERT INTO screenshot_files(
-                    id, household_id, child_id, device_id, event_id, session_id, local_path, sha256, size_bytes, ocr_text, captured_at
+                    id, household_id, child_id, device_id, event_id, session_id, local_path, sha256, size_bytes, ocr_text, captured_at, retention_expires_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now() + make_interval(days => %s))
                 """,
-                (self._new_id("shot"), household_id, child_id, device_id, event_id, session_id, local_path, sha256, size_bytes, ocr_text),
+                (self._new_id("shot"), household_id, child_id, device_id, event_id, session_id, local_path, sha256, size_bytes, ocr_text, self.RETENTION_SCREENSHOTS_DAYS),
             )
 
     @staticmethod

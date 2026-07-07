@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     # "postgres": decisions travel via pg_notify so any API instance — and a
     # standalone worker — can reach every SSE subscriber. No new infra.
     sse_bus: str = Field(default="memory", alias="WATCHIT_SSE_BUS")
+    # Hourly privacy sweep in the worker (docs/PRIVACY_LOGGING_AND_RETENTION.md).
+    retention_sweep_enabled: bool = Field(default=True, alias="WATCHIT_RETENTION_SWEEP_ENABLED")
     url_decision_cache_enabled: bool = Field(default=True, alias="WATCHIT_URL_DECISION_CACHE_ENABLED")
     url_decision_cache_ttl_seconds: int = Field(default=86400, alias="WATCHIT_URL_DECISION_CACHE_TTL_SECONDS")
     url_decision_cache_min_confidence: float = Field(default=0.85, alias="WATCHIT_URL_DECISION_CACHE_MIN_CONFIDENCE")
