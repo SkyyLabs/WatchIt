@@ -839,6 +839,45 @@ async def delete_rule(rule_id: str, guardian_ctx=Depends(require_guardian)):
     return {"ok": True}
 
 
+@app.get("/v1/rule-suggestions")
+def list_rule_suggestions(guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    return {"suggestions": db.list_rule_suggestions(household_id)}
+
+
+@app.post("/v1/rule-suggestions/{suggestion_id}/accept")
+async def accept_rule_suggestion(suggestion_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    suggestion = db.resolve_rule_suggestion(suggestion_id, household_id, status="accepted", guardian_id=guardian_id)
+    if not suggestion:
+        raise HTTPException(404, "suggestion not found")
+    rule = db.create_rule(
+        household_id,
+        action=suggestion["action"],
+        rule_type=suggestion["rule_type"],
+        pattern=suggestion["pattern"],
+        child_id=suggestion["child_id"],
+        reason="Learned from repeated overrides",
+        created_by_guardian_id=guardian_id,
+    )
+    db.log_audit(household_id, "rule_suggestion_accepted", guardian_id=guardian_id, entity_type="policy_rule", entity_id=rule["id"], metadata={"suggestion_id": suggestion_id, "pattern": suggestion["pattern"], "action": suggestion["action"], "evidence_count": suggestion["evidence_count"]})
+    logger.info("rule_suggestion_accepted", suggestion_id=suggestion_id, rule_id=rule["id"])
+    return {"rule": rule}
+
+
+@app.post("/v1/rule-suggestions/{suggestion_id}/dismiss")
+async def dismiss_rule_suggestion(suggestion_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    suggestion = db.resolve_rule_suggestion(suggestion_id, household_id, status="dismissed", guardian_id=guardian_id)
+    if not suggestion:
+        raise HTTPException(404, "suggestion not found")
+    db.log_audit(household_id, "rule_suggestion_dismissed", guardian_id=guardian_id, entity_type="rule_suggestion", entity_id=suggestion_id, metadata={"pattern": suggestion["pattern"], "action": suggestion["action"]})
+    logger.info("rule_suggestion_dismissed", suggestion_id=suggestion_id)
+    return {"ok": True}
+
+
 class RuleTestPayload(BaseModel):
     url: str
     child_id: str

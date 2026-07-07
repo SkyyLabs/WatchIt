@@ -38,6 +38,13 @@ class GuardianLearningLoop:
             await asyncio.sleep(self.interval)
 
     async def process_once(self) -> None:
+        # Learned rules: repeated same-direction overrides on a domain become
+        # pending suggestions the guardian accepts or dismisses in the dashboard
+        # — never auto-applied. Runs even when there is nothing new to distill
+        # into prompt guidance below.
+        suggested = db.generate_rule_suggestions()
+        if suggested:
+            self.logger.info("rule_suggestions_generated", count=suggested)
         overrides = db.fetch_unprocessed_overrides(100)
         if not overrides:
             return
