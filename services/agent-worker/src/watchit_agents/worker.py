@@ -17,9 +17,12 @@ logger = get_logger("watchit.agent_worker")
 class AgentWorker:
     """Consumes queued browser events and runs the safety pipeline."""
 
+    REAP_INTERVAL_SECONDS = 60.0
+
     def __init__(self, poll_interval: float | None = None, batch_size: int = 5):
         self.poll_interval = poll_interval if poll_interval is not None else settings.agent_worker_poll_interval
         self.batch_size = batch_size
+        self._last_reap = 0.0
 
     async def run_forever(self) -> None:
         bind_log_context(service="agent-worker")
@@ -28,6 +31,7 @@ class AgentWorker:
         logger.info("agent_worker_started", poll_interval=self.poll_interval, batch_size=self.batch_size)
         while True:
             try:
+                self.maybe_reap_stale_jobs()
                 await self.process_once()
             except asyncio.CancelledError:
                 logger.info("agent_worker_cancelled")
@@ -35,6 +39,17 @@ class AgentWorker:
             except Exception:
                 logger.exception("agent_worker_loop_failed")
             await asyncio.sleep(self.poll_interval)
+
+    def maybe_reap_stale_jobs(self) -> None:
+        # Recover jobs orphaned by a worker crash: requeue while attempts remain,
+        # dead-letter after. Time-gated so the sweep doesn't run on every poll.
+        now = time.monotonic()
+        if now - self._last_reap < self.REAP_INTERVAL_SECONDS:
+            return
+        self._last_reap = now
+        counts = db.reap_stale_event_jobs()
+        if counts["requeued"] or counts["dead_lettered"]:
+            logger.warning("stale_event_jobs_reaped", **counts)
 
     async def process_once(self) -> int:
         claim_started = time.perf_counter()

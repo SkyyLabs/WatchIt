@@ -55,5 +55,20 @@ export function displayReason(reason?: string | null): string {
   if (reason === "manual_override") return "Parent changed this decision";
   if (reason === "default allow") return "No risk detected";
   if (reason === "prefilter high") return "High-risk page signals";
+  if (reason === "system_uncertain") return "Safety check unavailable — page cautioned";
+  if (reason.startsWith("manual_rule:")) return "Your rule";
   return reason.replace(/_/g, " ");
+}
+
+// Which layer decided — answers "why did WatchIt act" at a glance.
+export function decidedBy(reason?: string | null): string | null {
+  if (!reason) return null;
+  if (reason.startsWith("manual_rule:")) return "Rule";
+  if (reason === "manual_override") return "Parent";
+  if (reason === "quiet hours") return "Schedule";
+  if (reason === "url_cache" || reason === "cached decision") return "Cache";
+  if (reason.startsWith("llm:") || reason === "pending_ocr") return "AI";
+  if (reason === "system_uncertain") return "System";
+  if (reason.startsWith("allowlist") || reason.startsWith("blocklist") || reason === "prefilter high" || reason.startsWith("headline")) return "Policy";
+  return null;
 }
