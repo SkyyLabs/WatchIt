@@ -674,30 +674,18 @@ async def create_pairing_code(payload: PairingCodePayload, guardian_ctx=Depends(
     return {"pairing_code": pairing}
 
 # /v1/device/redeem is unauthenticated (the code is the secret) and the code
-# space is 10^6, so brute force must be throttled. In-process sliding window —
-# adequate for the current single-instance API; move to a shared store before
-# scaling out.
-from collections import deque
-
+# space is 10^6, so brute force must be throttled. Postgres-backed sliding
+# window (rate_limit_hits) so the limits hold across API replicas.
 _REDEEM_WINDOW_SECONDS = 60
 _REDEEM_MAX_PER_IP = 10
 _REDEEM_MAX_GLOBAL = 100
-_redeem_by_ip: dict[str, deque] = {}
-_redeem_global: deque = deque()
 
 
-def _redeem_allowed(client_ip: str, now: float | None = None) -> bool:
-    now = now if now is not None else time.monotonic()
-    cutoff = now - _REDEEM_WINDOW_SECONDS
-    per_ip = _redeem_by_ip.setdefault(client_ip, deque())
-    for window in (per_ip, _redeem_global):
-        while window and window[0] < cutoff:
-            window.popleft()
-    if len(per_ip) >= _REDEEM_MAX_PER_IP or len(_redeem_global) >= _REDEEM_MAX_GLOBAL:
-        return False
-    per_ip.append(now)
-    _redeem_global.append(now)
-    return True
+def _redeem_allowed(client_ip: str) -> bool:
+    return db.rate_limit_allow(
+        [(f"redeem_ip:{client_ip}", _REDEEM_MAX_PER_IP), ("redeem_global", _REDEEM_MAX_GLOBAL)],
+        _REDEEM_WINDOW_SECONDS,
+    )
 
 
 @app.post("/v1/device/redeem")
