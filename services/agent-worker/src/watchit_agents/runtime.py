@@ -13,6 +13,26 @@ from watchit_core.policy.engine import PolicyEngine, _in_quiet_hours, _schedule_
 from watchit_core.policy.rules import evaluate_rules
 from watchit_core.screenshot_store import persist_screenshots_async
 
+# pg_notify payloads are capped at 8000 bytes; leave headroom for encoding.
+NOTIFY_PAYLOAD_LIMIT = 7900
+
+
+def _notify_payload(message: Dict[str, Any]) -> str:
+    payload = json.dumps(message, default=str)
+    if len(payload.encode("utf-8")) <= NOTIFY_PAYLOAD_LIMIT:
+        return payload
+    # Shed the bulky free-text fields first, then a pathological URL. The
+    # decision row in Postgres keeps the full detail either way.
+    trimmed = dict(message)
+    trimmed["llm_rationale"] = None
+    trimmed["title"] = None
+    payload = json.dumps(trimmed, default=str)
+    if len(payload.encode("utf-8")) > NOTIFY_PAYLOAD_LIMIT and trimmed.get("url"):
+        trimmed["url"] = str(trimmed["url"])[:2000]
+        payload = json.dumps(trimmed, default=str)
+    return payload
+
+
 class DecisionBus:
     def __init__(self):
         self._subs = set()
@@ -25,9 +45,23 @@ class DecisionBus:
     def unsubscribe(self, q):
         self._subs.discard(q)
 
-    async def publish(self, message: Dict[str, Any]):
+    async def deliver_local(self, message: Dict[str, Any]):
+        # Fan out to this process's SSE subscribers only.
         for q in list(self._subs):
             await q.put(message)
+
+    async def publish(self, message: Dict[str, Any]):
+        if settings.sse_bus == "postgres":
+            # Cross-instance path: pg_notify reaches every listening API
+            # instance (including this process, via its listener task).
+            try:
+                await asyncio.to_thread(db.notify_decision, _notify_payload(message))
+                return
+            except Exception:
+                # Decision row is already committed and the extension polls as
+                # fallback; still serve same-process subscribers.
+                logger.exception("decision_notify_failed", decision_id=message.get("decision_id"))
+        await self.deliver_local(message)
 
 bus = DecisionBus()
 policy = PolicyEngine()

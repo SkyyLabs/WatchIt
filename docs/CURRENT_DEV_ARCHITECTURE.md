@@ -191,7 +191,8 @@ tests at all), dashboard components.
 - Extension `config.js` hardcodes `apiBase: http://127.0.0.1:4849`; `skipHosts` are localhost
   ports. Manifest requests `<all_urls>` host permissions.
 - API CORS allows only `http://localhost:4848` / `http://127.0.0.1:4848`.
-- SSE bus is in-memory ⇒ exactly one API process, worker embedded.
+- SSE bus is in-memory by default (`WATCHIT_SSE_BUS=memory`); `postgres` mode fans decisions
+  out via pg_notify so multiple API instances and a standalone worker deliver to SSE.
 - Screenshots and Docling caches on local disk of the worker process.
 - No rate limiting, no request size limits, no TLS assumptions, no health endpoints
   (`/healthz` absent), no metrics endpoint.

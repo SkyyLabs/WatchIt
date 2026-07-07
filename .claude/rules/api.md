@@ -15,7 +15,7 @@ Pick the right dependency for every new route. Never authenticate an extension p
 
 Never trust client-submitted `child_id` / `household_id`. Extension events scope from the device token; guardian queries scope from the resolved household. This includes SSE — `sse.py` must preserve household filtering on the decision stream.
 
-The SSE decision bus is **in-memory**, so it only works with a single API instance. Multiple API replicas need a shared bus (Redis pub/sub or Postgres LISTEN/NOTIFY) before horizontal scaling — don't assume cross-instance delivery today.
+The SSE decision bus is **in-memory by default** (`WATCHIT_SSE_BUS=memory`) — single API instance, embedded worker only. `WATCHIT_SSE_BUS=postgres` switches to pg_notify fan-out: publish via `db.notify_decision`, each API instance runs a LISTEN task bridging into its local bus. Required for multiple API replicas or a standalone worker whose decisions must reach SSE subscribers.
 
 ## Route design
 
