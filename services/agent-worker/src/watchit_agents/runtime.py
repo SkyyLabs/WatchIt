@@ -229,7 +229,14 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
     # while the household-wide monitoring switch is off (kids browse unmonitored).
     pause_started = time.perf_counter()
     now_ms = int(time.time() * 1000)
-    monitoring_off = not db.is_household_monitoring_enabled(household_id)
+    # Prefer the browse-time snapshot taken at ingest; fall back to a live read
+    # (e.g. sync mode or older queued jobs) so the switch is still honored.
+    monitoring_snapshot = event.get("monitoring_enabled")
+    monitoring_off = (
+        not monitoring_snapshot
+        if monitoring_snapshot is not None
+        else not db.is_household_monitoring_enabled(household_id)
+    )
     paused_until = effective_pause_until(db, household_id, event.get("device_id"))
     pause_check_ms = _elapsed_ms(pause_started)
     if monitoring_off or (paused_until and now_ms < paused_until):

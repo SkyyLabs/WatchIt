@@ -202,6 +202,9 @@ async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
             logger.info("event_ignored_no_active_session", child_id=device["child_id"], device_id=device["id"])
             raise HTTPException(409, "monitoring is not active for this device")
         event["session_id"] = session["id"]
+        # Snapshot the household monitoring switch at browse time so a toggle after
+        # enqueue can't change how this already-observed visit is handled.
+        event["monitoring_enabled"] = db.is_household_monitoring_enabled(device["household_id"])
         if settings.processing_mode == "sync":
             logger.info("event_processing_sync", child_id=event.get("child_id"), tab_id=event.get("tab_id"), url=event.get("url"))
             return await process_event(event, upgrade=False)
@@ -225,6 +228,7 @@ async def post_event_upgrade(evt: UpgradeInput, device_ctx=Depends(require_devic
             logger.info("event_upgrade_ignored_no_active_session", child_id=device["child_id"], device_id=device["id"])
             raise HTTPException(409, "monitoring is not active for this device")
         event["session_id"] = session["id"]
+        event["monitoring_enabled"] = db.is_household_monitoring_enabled(device["household_id"])
         if settings.processing_mode == "sync":
             logger.info("event_upgrade_processing_sync", event_id=event.get("id"), child_id=event.get("child_id"))
             return await process_event(event, upgrade=True)
