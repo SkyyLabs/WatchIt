@@ -951,6 +951,16 @@ class Database:
             )
             return cur.fetchone()
 
+    def peek_url_decision(self, cache_key: str, ttl_seconds: int, household_id: str) -> Optional[Dict[str, Any]]:
+        # Read-only cache lookup for the rule tester — must not bump hit_count.
+        min_updated_at = int(time.time() * 1000) - max(0, ttl_seconds) * 1000
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM url_decision_cache WHERE cache_key=%s AND updated_at >= %s AND household_id=%s",
+                (cache_key, min_updated_at, household_id),
+            )
+            return cur.fetchone()
+
     def upsert_url_decision_cache(
         self,
         *,
@@ -1082,6 +1092,46 @@ class Database:
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
             params.append(limit)
             cur.execute(base_query + where + " ORDER BY e.ts DESC LIMIT %s", params)
+            return cur.fetchall()
+
+    def list_review_decisions(self, household_id: str, child_id: Optional[str] = None, limit: int = 30) -> List[Dict[str, Any]]:
+        """Guardian review queue: recent decisions (7 days) worth a look with no
+        override yet — restrictive actions, pending OCR, system_uncertain
+        degradations, low-confidence judgments. Severity first, then recency."""
+        since_ms = int(time.time() * 1000) - 7 * 24 * 3600 * 1000
+        clauses = ["e.household_id=%s", "e.ts >= %s", "o.id IS NULL"]
+        params: List[Any] = [household_id, since_ms]
+        if child_id:
+            clauses.append("e.child_id=%s")
+            params.append(child_id)
+        params.append(limit)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    d.id, d.event_id, d.action, d.reason, d.details_json, d.original_action,
+                    e.url, e.title, e.domain, e.ts, e.child_id, e.device_id
+                FROM decisions d
+                JOIN events e ON d.event_id=e.id
+                LEFT JOIN LATERAL (
+                    SELECT id FROM decision_overrides o
+                    WHERE o.decision_id=d.id
+                    ORDER BY o.created_at DESC
+                    LIMIT 1
+                ) o ON TRUE
+                WHERE {" AND ".join(clauses)}
+                  AND (
+                    d.action IN ('block','blur','warn','notify')
+                    OR d.reason IN ('pending_ocr','system_uncertain')
+                    OR COALESCE((d.details_json->>'confidence')::float, 1.0) < 0.5
+                  )
+                ORDER BY
+                    CASE d.action WHEN 'block' THEN 0 WHEN 'blur' THEN 1 WHEN 'warn' THEN 2 ELSE 3 END,
+                    e.ts DESC
+                LIMIT %s
+                """,
+                params,
+            )
             return cur.fetchall()
 
     def get_decision_with_event(self, decision_id: str, household_id: Optional[str] = None) -> Optional[Dict[str, Any]]:

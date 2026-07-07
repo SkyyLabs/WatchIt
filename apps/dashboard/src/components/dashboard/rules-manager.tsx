@@ -31,11 +31,24 @@ type FormState = {
   scope: string; // HOUSEHOLD_SCOPE or the child id
 };
 
+type TestResult = { action: string; layer: string; detail: string };
+
+const LAYER_LABEL: Record<string, string> = {
+  rule: "your rule",
+  schedule: "quiet hours",
+  cache: "recent decision",
+  policy: "built-in policy",
+  ai: "AI review",
+};
+
 export function RulesManager({ childId, getToken }: { childId: string; getToken: () => Promise<string | null> }) {
   const [rules, setRules] = useState<Rule[]>([]);
   const [form, setForm] = useState<FormState>({ action: "block", ruleType: "domain", pattern: "", reason: "", scope: childId });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [testUrl, setTestUrl] = useState("");
+  const [testResult, setTestResult] = useState<TestResult | null>(null);
+  const [testing, setTesting] = useState(false);
 
   const load = useCallback(async () => {
     setError(null);
@@ -77,6 +90,28 @@ export function RulesManager({ childId, getToken }: { childId: string; getToken:
       setError(String(e));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const runTest = async () => {
+    if (!testUrl.trim()) {
+      setError("Enter a URL to test.");
+      return;
+    }
+    setTesting(true);
+    setError(null);
+    setTestResult(null);
+    try {
+      const authToken = await getToken();
+      const result = await apiFetch<TestResult>("/v1/rules/test", authToken, {
+        method: "POST",
+        body: JSON.stringify({ url: testUrl.trim(), child_id: childId }),
+      });
+      setTestResult(result);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setTesting(false);
     }
   };
 
@@ -186,6 +221,35 @@ export function RulesManager({ childId, getToken }: { childId: string; getToken:
           </div>
           <Button size="sm" disabled={busy} onClick={save}>Add rule</Button>
         </div>
+      </div>
+
+      <div className="space-y-3 rounded-md border bg-background p-3">
+        <p className="text-sm font-medium">Test a URL</p>
+        <p className="text-xs text-muted-foreground">
+          See what would happen right now for this child — which rule, schedule, or cached decision applies.
+        </p>
+        <div className="flex items-end gap-2">
+          <div className="flex-1 space-y-1.5">
+            <Label htmlFor={`rt-${childId}`}>URL</Label>
+            <Input
+              id={`rt-${childId}`}
+              placeholder="https://example.com/page"
+              value={testUrl}
+              onChange={(e) => setTestUrl(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") void runTest(); }}
+            />
+          </div>
+          <Button size="sm" disabled={testing} onClick={runTest}>Test</Button>
+        </div>
+        {testResult && (
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <Badge variant={testResult.action === "block" ? "destructive" : testResult.action === "allow" ? "success" : "secondary"}>
+              {testResult.action === "unknown" ? "needs AI review" : testResult.action}
+            </Badge>
+            <Badge variant="outline">{LAYER_LABEL[testResult.layer] || testResult.layer}</Badge>
+            <span className="text-muted-foreground">{testResult.detail}</span>
+          </div>
+        )}
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}

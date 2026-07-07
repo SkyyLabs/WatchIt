@@ -61,11 +61,6 @@ export type DecisionRecord = {
   title?: string;
 };
 
-export type AttentionItem = DecisionRecord & {
-  riskLevel: "high" | "medium" | "low";
-  priority: number;
-};
-
 export type DashboardMetrics = {
   safetyScore: number | null;
   sitesChecked: number;
@@ -133,29 +128,6 @@ export function computeMetrics(decisions: DecisionRecord[], events: EventRecord[
     overrideCount: decisions.filter((decision) => decision.manual_flagged).length,
     latestRisk: risky[0] || null,
   };
-}
-
-export function attentionItems(decisions: DecisionRecord[]): AttentionItem[] {
-  return decisions
-    .filter((decision) => {
-      const categories = decision.categories || [];
-      return (
-        RISK_ACTIONS.has(decision.action) ||
-        decision.reason === "pending_ocr" ||
-        categories.some((category) => /adult|risk|harm|bully|violence|headline|schedule/i.test(category))
-      );
-    })
-    .map((decision) => {
-      const priority = decision.action === "block" ? 100 : decision.action === "blur" ? 80 : decision.action === "warn" ? 60 : 40;
-      const riskLevel: AttentionItem["riskLevel"] = priority >= 90 ? "high" : priority >= 60 ? "medium" : "low";
-      return {
-        ...decision,
-        priority,
-        riskLevel,
-      };
-    })
-    .sort((a, b) => b.priority - a.priority || Number(b.ts || 0) - Number(a.ts || 0))
-    .slice(0, 8);
 }
 
 export function categoryBreakdown(decisions: DecisionRecord[], events: EventRecord[]) {

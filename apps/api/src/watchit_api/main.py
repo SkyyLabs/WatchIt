@@ -26,6 +26,8 @@ from watchit_agents.worker import AgentWorker
 from watchit_learning.guardian_learning import GuardianLearningLoop
 from watchit_api.auth import require_device, require_device_stream, require_guardian, require_guardian_stream
 from watchit_core.url_cache import url_cache_key
+from watchit_core.policy.engine import PolicyEngine, _in_quiet_hours, _schedule_now
+from watchit_core.policy.rules import domain_suffix_match, evaluate_rules, host_of
 
 from watchit_core.activity_logger import log_service_event, log_service_shutdown
 
@@ -783,6 +785,86 @@ async def delete_rule(rule_id: str, guardian_ctx=Depends(require_guardian)):
     db.log_audit(household_id, "rule_deleted", guardian_id=guardian_id, entity_type="policy_rule", entity_id=rule_id)
     logger.info("rule_deleted", rule_id=rule_id)
     return {"ok": True}
+
+
+class RuleTestPayload(BaseModel):
+    url: str
+    child_id: str
+    device_id: Optional[str] = None
+
+
+_policy_engine = PolicyEngine()
+
+
+@app.post("/v1/rules/test")
+def test_rules(payload: RuleTestPayload, guardian_ctx=Depends(require_guardian)):
+    """Dry-run of the deterministic layers for one URL, right now: manual rules
+    → quiet hours → cached decisions → static policy lists → 'AI would judge'.
+    Read-only — never mutates cache counters or writes decisions."""
+    household_id = guardian_ctx["household"]["id"]
+    profile = db.get_child_profile(payload.child_id, household_id)
+    if not profile:
+        raise HTTPException(404, "child not found")
+    url = payload.url.strip()
+    if not url:
+        raise HTTPException(400, "url is required")
+    if "://" not in url:
+        url = "https://" + url
+
+    rules = db.list_active_rules(household_id, payload.child_id, payload.device_id)
+    winning = evaluate_rules(rules, url)
+    if winning:
+        return {
+            "action": winning["action"],
+            "layer": "rule",
+            "detail": f"{winning['rule_type']} rule for {winning['pattern']}",
+            "rule_id": winning["id"],
+        }
+
+    for schedule in db.get_effective_quiet_schedules(household_id, payload.child_id, payload.device_id):
+        sched_now = _schedule_now({"timezone": schedule.get("timezone")})
+        if _in_quiet_hours(sched_now, schedule.get("days") or "", f"{schedule['quiet_start']}-{schedule['quiet_end']}"):
+            return {
+                "action": "block",
+                "layer": "schedule",
+                "detail": f"quiet hours {schedule['quiet_start']}–{schedule['quiet_end']} are active now",
+            }
+
+    if settings.url_decision_cache_enabled:
+        _normalized, cache_key = url_cache_key(
+            url=url,
+            child_id=payload.child_id,
+            strictness=profile.get("strictness"),
+            age=profile.get("age"),
+            policy_version=settings.policy_version,
+        )
+        cached = db.peek_url_decision(cache_key, settings.url_decision_cache_ttl_seconds, household_id)
+        if cached:
+            return {
+                "action": cached["action"],
+                "layer": "cache",
+                "detail": f"recent decision ({cached.get('reason') or 'cached'})",
+            }
+
+    host = host_of(url)
+    for allowed in _policy_engine.allow_domains:
+        if domain_suffix_match(host, allowed):
+            return {"action": "allow", "layer": "policy", "detail": f"built-in allowlist ({allowed})"}
+    for blocked in _policy_engine.block_domains:
+        if domain_suffix_match(host, blocked):
+            return {"action": "block", "layer": "policy", "detail": f"built-in blocklist ({blocked})"}
+
+    return {
+        "action": "unknown",
+        "layer": "ai",
+        "detail": "no deterministic rule applies — the AI pipeline would judge this page on visit",
+    }
+
+
+@app.get("/v1/review-queue")
+def get_review_queue(child_id: str | None = None, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    return {"items": db.list_review_decisions(household_id, child_id)}
 
 
 @app.patch("/v1/devices/{device_id}")
