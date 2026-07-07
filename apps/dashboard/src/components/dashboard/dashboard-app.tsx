@@ -31,7 +31,6 @@ import { apiFetch, ApiError } from "@/lib/api-client";
 import { downloadClientLogFile } from "@/lib/client-logger";
 import { useDashboardData } from "@/lib/dashboard-data";
 import {
-  attentionItems,
   categoryBreakdown,
   ChildProfile,
   computeMetrics,
@@ -54,6 +53,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ChildrenView } from "@/components/dashboard/children-view";
 import { HouseholdView } from "@/components/dashboard/household-view";
 import { ProtectionStatus } from "@/components/dashboard/protection-status";
+import { ReviewQueue } from "@/components/dashboard/review-queue";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -112,10 +112,8 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
   const { user } = useUser();
   const [timeRange, setTimeRange] = useState<TimeRange>("today");
   const [actionError, setActionError] = useState<string | null>(null);
-  const [dismissed, setDismissed] = useState<Record<string, boolean>>({});
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [monitoringSession, setMonitoringSession] = useState<any>(null);
-  const [decisionSaving, setDecisionSaving] = useState<Record<string, boolean>>({});
   const [childDialogOpen, setChildDialogOpen] = useState(false);
   const [childDialogMode, setChildDialogMode] = useState<"create" | "edit">("create");
   const [pinDialogOpen, setPinDialogOpen] = useState(false);
@@ -169,10 +167,6 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
     [events, selectedChild, timeRange],
   );
   const metrics = useMemo(() => computeMetrics(filteredDecisions, filteredEvents), [filteredDecisions, filteredEvents]);
-  const attention = useMemo(
-    () => attentionItems(filteredDecisions).filter((item) => !dismissed[item.id]),
-    [dismissed, filteredDecisions],
-  );
   const categories = useMemo(
     () => categoryBreakdown(filteredDecisions, filteredEvents),
     [filteredDecisions, filteredEvents],
@@ -328,25 +322,6 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
     });
   };
 
-  const overrideDecision = async (decisionId: string, action: string) => {
-    setDecisionSaving((previous) => ({ ...previous, [decisionId]: true }));
-    try {
-      const authToken = await token();
-      const data = await apiFetch<{ decision: DecisionRecord }>(`/v1/decisions/${decisionId}/override`, authToken, {
-        method: "POST",
-        body: JSON.stringify({ action }),
-      });
-      const normalized = normalizeDecision(data.decision);
-      setDecisions((previous) => previous.map((decision) => decision.id === normalized.id ? normalized : decision));
-    } finally {
-      setDecisionSaving((previous) => {
-        const next = { ...previous };
-        delete next[decisionId];
-        return next;
-      });
-    }
-  };
-
   if (!isLoaded) return <DashboardSkeleton />;
   if (!isSignedIn) return <SignedOut />;
 
@@ -430,7 +405,6 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
               selectedChild={selectedChildProfile}
               activeChildId={activeChildId}
               metrics={metrics}
-              attention={attention}
               decisions={filteredDecisions}
               events={filteredEvents}
               categories={categories}
@@ -439,7 +413,6 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
               nowMs={nowMs}
               pairingCode={pairingCode}
               monitoringSession={monitoringSession}
-              decisionSaving={decisionSaving}
               onSetupPin={() => {
                 setPinDialogMode(security?.parent_pin_set ? "change" : "setup");
                 setPinDialogOpen(true);
@@ -451,8 +424,6 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
               onPair={createPairingCode}
               onStartMonitoring={startMonitoring}
               onStopMonitoring={stopMonitoring}
-              onDismiss={(id) => setDismissed((previous) => ({ ...previous, [id]: true }))}
-              onOverride={overrideDecision}
               onEditChild={() => {
                 setChildDialogMode("edit");
                 setChildDialogOpen(true);
@@ -692,7 +663,6 @@ function HomeDashboardView(props: {
   selectedChild: ChildProfile | null;
   activeChildId: string | null;
   metrics: ReturnType<typeof computeMetrics>;
-  attention: ReturnType<typeof attentionItems>;
   decisions: DecisionRecord[];
   events: EventRecord[];
   categories: ReturnType<typeof categoryBreakdown>;
@@ -701,14 +671,11 @@ function HomeDashboardView(props: {
   nowMs: number;
   pairingCode: string | null;
   monitoringSession: any;
-  decisionSaving: Record<string, boolean>;
   onSetupPin: () => void;
   onAddChild: () => void;
   onPair: () => void;
   onStartMonitoring: () => void;
   onStopMonitoring: () => void;
-  onDismiss: (id: string) => void;
-  onOverride: (id: string, action: string) => void;
   onEditChild: () => void;
   onResume: () => void;
 }) {
@@ -732,12 +699,7 @@ function HomeDashboardView(props: {
       <ProtectionStatus />
       <SafetyOverview metrics={props.metrics} />
       <div className="grid gap-6 xl:grid-cols-[1.35fr_.85fr]">
-        <AttentionNeeded
-          items={props.attention}
-          saving={props.decisionSaving}
-          onDismiss={props.onDismiss}
-          onOverride={props.onOverride}
-        />
+        <ReviewQueue childId={props.selectedChild?.id ?? null} />
         <ControlsSummary {...props} />
       </div>
       <div className="grid gap-6 xl:grid-cols-[1.2fr_.8fr]">
@@ -827,43 +789,6 @@ function SafetyOverview({ metrics }: { metrics: ReturnType<typeof computeMetrics
         );
       })}
     </div>
-  );
-}
-
-function AttentionNeeded(props: {
-  items: ReturnType<typeof attentionItems>;
-  saving: Record<string, boolean>;
-  onDismiss: (id: string) => void;
-  onOverride: (id: string, action: string) => void;
-}) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Attention needed</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {props.items.length === 0 ? (
-          <EmptyMini icon={Check} title="Nothing urgent right now" text="Risky or blocked pages will appear here for quick review." />
-        ) : props.items.map((item) => (
-          <div key={item.id} className="rounded-lg border p-4">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div className="min-w-0">
-                <Badge variant={riskVariant(item.riskLevel)}>{item.riskLevel} risk</Badge>
-                <h3 className="mt-2 truncate font-medium">{item.title || domainFromUrl(item.url)}</h3>
-                <p className="mt-1 text-sm text-muted-foreground">{displayReason(item.reason)}</p>
-                <p className="mt-1 text-xs text-muted-foreground">{formatDateTime(item.ts)} · {domainFromUrl(item.url)}</p>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <Button size="sm" variant="outline" disabled={!item.url} onClick={() => item.url && window.open(item.url, "_blank", "noreferrer")}>Review</Button>
-                <Button size="sm" variant="outline" disabled={props.saving[item.id]} onClick={() => props.onOverride(item.id, "allow")}>Allow</Button>
-                <Button size="sm" variant="destructive" disabled={props.saving[item.id]} onClick={() => props.onOverride(item.id, "block")}>Block</Button>
-                <Button size="sm" variant="ghost" onClick={() => props.onDismiss(item.id)}>Dismiss</Button>
-              </div>
-            </div>
-          </div>
-        ))}
-      </CardContent>
-    </Card>
   );
 }
 
@@ -1216,12 +1141,6 @@ function DashboardSkeleton() {
       </div>
     </div>
   );
-}
-
-function riskVariant(level: string): "destructive" | "warning" | "info" {
-  if (level === "high") return "destructive";
-  if (level === "medium") return "warning";
-  return "info";
 }
 
 function clampAge(value: string) {
