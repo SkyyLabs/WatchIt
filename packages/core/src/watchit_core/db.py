@@ -21,6 +21,10 @@ from watchit_core.migrations import run_migrations
 from watchit_core.url_cache import normalize_url
 from watchit_core.policy.rules import HIGH_RISK_TOKENS
 
+# pg_notify channel carrying decision messages between worker and API instances
+# when WATCHIT_SSE_BUS=postgres.
+DECISION_CHANNEL = "watchit_decisions"
+
 
 class Database:
     """Postgres-backed repository used by API and workers."""
@@ -76,6 +80,13 @@ class Database:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT 1")
         return True
+
+    def notify_decision(self, payload: str) -> None:
+        # Shared SSE bus (WATCHIT_SSE_BUS=postgres): fan decision messages out to
+        # every listening API instance via pg_notify. Payload is the serialized
+        # decision message; callers keep it under the 8000-byte NOTIFY limit.
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_notify(%s, %s)", (DECISION_CHANNEL, payload))
 
     def close(self) -> None:
         if self._pool is not None:

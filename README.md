@@ -116,6 +116,7 @@ Load the browser extension from `apps/browser-extension` through `chrome://exten
 | `WATCHIT_PROCESSING_MODE` | `async` queue mode or `sync` compatibility mode | `async` |
 | `WATCHIT_EMBEDDED_AGENT_WORKER` | Run worker inside the API process for local development | `true` |
 | `WATCHIT_AGENT_WORKER_POLL_INTERVAL` | Worker queue polling interval in seconds | `0.5` |
+| `WATCHIT_SSE_BUS` | Decision SSE fan-out: `memory` (single API instance) or `postgres` (pg_notify — multi-instance API and standalone worker) | `memory` |
 | `WATCHIT_URL_DECISION_CACHE_ENABLED` | Reuse recent high-confidence URL decisions | `true` |
 | `WATCHIT_URL_DECISION_CACHE_TTL_SECONDS` | URL decision cache TTL | `86400` |
 | `WATCHIT_URL_DECISION_CACHE_MIN_CONFIDENCE` | Minimum confidence required before caching pipeline decisions | `0.85` |

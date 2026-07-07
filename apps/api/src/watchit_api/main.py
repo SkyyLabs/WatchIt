@@ -10,8 +10,9 @@ from starlette.background import BackgroundTask
 from starlette.responses import Response
 from pydantic import BaseModel
 from typing import Literal, Optional
+import orjson
 from watchit_api.schemas import ClientLogBatch, EventInput
-from watchit_core.db import db
+from watchit_core.db import DECISION_CHANNEL, db
 from watchit_core.config import settings
 from watchit_core.logging import bind_log_context, clear_log_context, configure_logging, get_logger, shutdown_logging
 
@@ -42,6 +43,38 @@ _learning_loop: GuardianLearningLoop | None = None
 _learning_task: asyncio.Task | None = None
 _agent_worker: AgentWorker | None = None
 _agent_worker_task: asyncio.Task | None = None
+_decision_listener_task: asyncio.Task | None = None
+
+
+async def _deliver_notify_payload(payload: str) -> None:
+    try:
+        message = orjson.loads(payload)
+    except orjson.JSONDecodeError:
+        logger.warning("decision_listener_bad_payload")
+        return
+    await bus.deliver_local(message)
+
+
+async def _decision_listener() -> None:
+    # WATCHIT_SSE_BUS=postgres: bridge pg_notify decision messages into this
+    # instance's in-memory bus so SSE subscribers hear decisions published by
+    # any API instance or a standalone worker. Reconnects forever on failure.
+    import psycopg
+
+    dsn = db.dsn or settings.database_url
+    while True:
+        try:
+            async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
+                await conn.execute(f"LISTEN {DECISION_CHANNEL}")
+                logger.info("decision_listener_connected", channel=DECISION_CHANNEL)
+                async for notification in conn.notifies():
+                    await _deliver_notify_payload(notification.payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("decision_listener_disconnected")
+            await asyncio.sleep(2)
+
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -90,7 +123,7 @@ async def _startup():
         embedded_agent_worker=settings.embedded_agent_worker,
     )
     db.connect()
-    global _learning_loop, _learning_task, _agent_worker, _agent_worker_task
+    global _learning_loop, _learning_task, _agent_worker, _agent_worker_task, _decision_listener_task
     if _learning_task is None:
         _learning_loop = GuardianLearningLoop()
         _learning_task = asyncio.create_task(_learning_loop.run_forever())
@@ -98,13 +131,23 @@ async def _startup():
         _agent_worker = AgentWorker()
         _agent_worker_task = asyncio.create_task(_agent_worker.run_forever())
         logger.info("embedded_agent_worker_started")
+    if settings.sse_bus == "postgres" and _decision_listener_task is None:
+        _decision_listener_task = asyncio.create_task(_decision_listener())
+        logger.info("decision_listener_started")
 
 
 @app.on_event("shutdown")
 async def _shutdown():
     log_service_shutdown({"service": "api"})
     logger.info("api_shutdown")
-    global _learning_task, _agent_worker_task
+    global _learning_task, _agent_worker_task, _decision_listener_task
+    if _decision_listener_task:
+        _decision_listener_task.cancel()
+        try:
+            await _decision_listener_task
+        except asyncio.CancelledError:
+            pass
+        _decision_listener_task = None
     if _agent_worker_task:
         _agent_worker_task.cancel()
         try:

@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     processing_mode: str = Field(default="async", alias="WATCHIT_PROCESSING_MODE")
     embedded_agent_worker: bool = Field(default=True, alias="WATCHIT_EMBEDDED_AGENT_WORKER")
     agent_worker_poll_interval: float = Field(default=0.5, alias="WATCHIT_AGENT_WORKER_POLL_INTERVAL")
+    # "memory": in-process fan-out only (single API instance, embedded worker).
+    # "postgres": decisions travel via pg_notify so any API instance — and a
+    # standalone worker — can reach every SSE subscriber. No new infra.
+    sse_bus: str = Field(default="memory", alias="WATCHIT_SSE_BUS")
     url_decision_cache_enabled: bool = Field(default=True, alias="WATCHIT_URL_DECISION_CACHE_ENABLED")
     url_decision_cache_ttl_seconds: int = Field(default=86400, alias="WATCHIT_URL_DECISION_CACHE_TTL_SECONDS")
     url_decision_cache_min_confidence: float = Field(default=0.85, alias="WATCHIT_URL_DECISION_CACHE_MIN_CONFIDENCE")
