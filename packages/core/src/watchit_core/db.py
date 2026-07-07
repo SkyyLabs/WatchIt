@@ -96,6 +96,31 @@ class Database:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT pg_notify(%s, %s)", (DECISION_CHANNEL, payload))
 
+    def rate_limit_allow(self, scopes: List[Tuple[str, int]], window_seconds: int) -> bool:
+        """Sliding-window throttle shared across API instances.
+
+        `scopes` is [(scope_key, max_hits), ...]; the request is allowed only if
+        every scope is under its limit, and then one hit is recorded per scope.
+        Expired hits for the checked scopes are pruned in the same transaction.
+        """
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - window_seconds * 1000
+        scope_keys = [scope for scope, _ in scopes]
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM rate_limit_hits WHERE scope = ANY(%s) AND ts < %s", (scope_keys, cutoff_ms))
+            cur.execute(
+                "SELECT scope, COUNT(*) AS hits FROM rate_limit_hits WHERE scope = ANY(%s) GROUP BY scope",
+                (scope_keys,),
+            )
+            counts = {row["scope"]: int(row["hits"]) for row in cur.fetchall()}
+            if any(counts.get(scope, 0) >= limit for scope, limit in scopes):
+                return False
+            cur.executemany(
+                "INSERT INTO rate_limit_hits(scope, ts) VALUES (%s, %s)",
+                [(scope, now_ms) for scope in scope_keys],
+            )
+        return True
+
     def close(self) -> None:
         if self._pool is not None:
             self._pool.close()
@@ -938,6 +963,10 @@ class Database:
             counts["audit_purged"] = cur.rowcount
             cur.execute("DELETE FROM url_decision_cache WHERE expires_at IS NOT NULL AND expires_at < now()")
             counts["url_cache_purged"] = cur.rowcount
+            # Rate-limit hits for scopes never checked again (one-off IPs) aren't
+            # pruned inline — sweep anything older than an hour.
+            cur.execute("DELETE FROM rate_limit_hits WHERE ts < %s", (now_ms - 3_600_000,))
+            counts["rate_limit_hits_purged"] = cur.rowcount
         # Unlink files only after the rows are committed; a leftover file with no
         # row is re-swept as untracked noise, a row with no file would 404 forever.
         for path in screenshot_paths:
