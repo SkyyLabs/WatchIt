@@ -118,6 +118,7 @@ Load the browser extension from `apps/browser-extension` through `chrome://exten
 | `WATCHIT_AGENT_WORKER_POLL_INTERVAL` | Worker queue polling interval in seconds | `0.5` |
 | `WATCHIT_SSE_BUS` | Decision SSE fan-out: `memory` (single API instance) or `postgres` (pg_notify — multi-instance API and standalone worker) | `memory` |
 | `WATCHIT_RETENTION_SWEEP_ENABLED` | Hourly privacy sweep in the worker: strips aged DOM samples, purges finished jobs, expired screenshots, old events/audit rows | `true` |
+| `WATCHIT_CORS_ORIGINS` | Comma-separated dashboard origins allowed by CORS | `http://127.0.0.1:4848,http://localhost:4848` |
 | `WATCHIT_URL_DECISION_CACHE_ENABLED` | Reuse recent high-confidence URL decisions | `true` |
 | `WATCHIT_URL_DECISION_CACHE_TTL_SECONDS` | URL decision cache TTL | `86400` |
 | `WATCHIT_URL_DECISION_CACHE_MIN_CONFIDENCE` | Minimum confidence required before caching pipeline decisions | `0.85` |
@@ -159,6 +160,26 @@ Guardian/admin endpoints require Clerk bearer tokens. Extension ingest endpoints
 - LLM: Claude primary with local Ollama/Llama fallback where available.
 
 The worker host is simply the platform that runs background processing outside HTTP requests. Render is the current choice because the agent worker can run as a long-lived process with Docling OCR/model dependencies while sharing the same Neon `DATABASE_URL` as the API.
+
+### Containers
+
+One backend image serves both the API (default CMD) and the worker (`python -m watchit_agents.worker`); the dashboard has its own image under `apps/dashboard/Dockerfile` (Clerk publishable key and API base are build args — they are public and baked into the client bundle; `CLERK_SECRET_KEY` is runtime-only).
+
+```bash
+docker compose up --build          # Postgres + API + standalone worker + dashboard
+```
+
+The compose stack runs the hosted shape: out-of-process worker and `WATCHIT_SSE_BUS=postgres` so decisions reach SSE subscribers across processes. Hosted deploys must also set `WATCHIT_CORS_ORIGINS` to the production dashboard origin.
+
+### Extension per environment
+
+The extension stays dependency-free; "building" regenerates `config.js` for a target API:
+
+```bash
+make build-extension EXT_API_BASE=https://api.example.com   # → dist/browser-extension
+```
+
+Load `dist/browser-extension` unpacked, or zip it for store upload.
 
 ## Logging
 

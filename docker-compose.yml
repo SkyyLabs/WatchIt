@@ -1,0 +1,63 @@
+# Hosted-shape local stack: Postgres + API + standalone worker + dashboard.
+# Secrets come from .env at the repo root (DATABASE_URL is overridden below to
+# point at the bundled Postgres). For Neon or another managed Postgres, drop
+# the db service and set DATABASE_URL in .env instead.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: watchit
+      POSTGRES_PASSWORD: watchit
+      POSTGRES_DB: watchit
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U watchit"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://watchit:watchit@db:5432/watchit
+      WATCHIT_EMBEDDED_AGENT_WORKER: "false"
+      WATCHIT_SSE_BUS: postgres
+      WATCHIT_CORS_ORIGINS: http://127.0.0.1:4848,http://localhost:4848
+    ports:
+      - "4849:4849"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python -m watchit_agents.worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://watchit:watchit@db:5432/watchit
+      WATCHIT_SSE_BUS: postgres
+    volumes:
+      # Screenshot bytes stay on worker-local disk, never in Postgres.
+      - screenshots:/app/screenshots
+    depends_on:
+      db:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: apps/dashboard
+      args:
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+        NEXT_PUBLIC_API_BASE_URL: http://127.0.0.1:4849
+    environment:
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY}
+    ports:
+      - "4848:4848"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  screenshots:

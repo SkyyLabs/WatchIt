@@ -86,3 +86,6 @@ test_output/
 *.pem
 *.key
 *.crt
+
+# Per-environment extension builds (make build-extension)
+dist/
