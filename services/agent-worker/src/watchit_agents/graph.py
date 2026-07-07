@@ -21,6 +21,12 @@ from watchit_core.activity_logger import log_agent_step
 HEADLINE_DECISION_THRESHOLD = 0.85
 
 
+def _vision_judge_active() -> bool:
+    # Screenshots go straight to the multimodal judge only when the provider
+    # can actually see them; Docling OCR remains the local/ollama path.
+    return settings.vision_judge and (settings.llm_provider or "").lower() in {"anthropic", "claude"}
+
+
 class MonitorState(BaseModel):
     event: Dict[str, Any]
     child_profile: Dict[str, Any] = Field(default_factory=dict)
@@ -123,16 +129,28 @@ def node_ocr(state: MonitorState) -> MonitorState:
 
     screenshots = screens_agent.get_screenshots(state.event)
     if screenshots:
-        ocr_text = ocr_agent.extract_text(screenshots)
+        vision = _vision_judge_active()
+        if vision:
+            # Multimodal path: the judge sees the screenshot directly — removes
+            # the Docling hop and a second text-only round trip.
+            ocr_text = ""
+            refreshed = url_agent.run(
+                state.event,
+                state.child_profile,
+                fast_scores=state.fast_scores or None,
+                images_b64=screenshots,
+            )
+        else:
+            ocr_text = ocr_agent.extract_text(screenshots)
+            # Always re-judge (even when OCR text is empty) so judge_json is populated
+            # and policy never falls through to its default-allow branch.
+            refreshed = url_agent.run(
+                state.event,
+                state.child_profile,
+                extra_text=ocr_text,
+                fast_scores=state.fast_scores or None,
+            )
         state.ocr_text = ocr_text
-        # Always re-judge (even when OCR text is empty) so judge_json is populated
-        # and policy never falls through to its default-allow branch.
-        refreshed = url_agent.run(
-            state.event,
-            state.child_profile,
-            extra_text=ocr_text,
-            fast_scores=state.fast_scores or None,
-        )
         state.fast_scores = refreshed.fast_scores
         state.judge_json = refreshed.llm_decision
         state.confidence = refreshed.confidence
@@ -140,12 +158,12 @@ def node_ocr(state: MonitorState) -> MonitorState:
         state.needs_screenshot = False
         log_agent_step(
             "OCRAgent",
-            "ocr_run",
+            "vision_judge_run" if vision else "ocr_run",
             state.event,
-            {"screenshot_count": len(screenshots)},
+            {"screenshot_count": len(screenshots), "vision": vision},
             {"ocr_text_preview": ocr_text[:120], "llm_decision": refreshed.llm_decision, "confidence": refreshed.confidence},
             {},
-            "OCR executed; re-judged with OCR text",
+            "screenshots judged directly" if vision else "OCR executed; re-judged with OCR text",
         )
         return state
 

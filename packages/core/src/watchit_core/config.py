@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     url_decision_cache_ttl_seconds: int = Field(default=86400, alias="WATCHIT_URL_DECISION_CACHE_TTL_SECONDS")
     url_decision_cache_min_confidence: float = Field(default=0.85, alias="WATCHIT_URL_DECISION_CACHE_MIN_CONFIDENCE")
     enable_ocr: bool = Field(default=True, alias="WATCHIT_ENABLE_OCR")
+    # Send screenshots straight to the (multimodal) judge instead of the Docling
+    # OCR hop. Only effective when the provider is anthropic; Docling remains
+    # the fallback for local/ollama deployments.
+    vision_judge: bool = Field(default=True, alias="WATCHIT_VISION_JUDGE")
     ocr_confidence_threshold: float = Field(default=0.7, alias="WATCHIT_OCR_CONFIDENCE_THRESHOLD")
     save_screenshots: bool = Field(default=False, alias="WATCHIT_SAVE_SCREENSHOTS")
     screenshots_dir: str = Field(default="screenshots", alias="WATCHIT_SCREENSHOT_DIR")

@@ -127,6 +127,7 @@ Load the browser extension from `apps/browser-extension` through `chrome://exten
 | `WATCHIT_ANTHROPIC_MODEL` | Claude model | `claude-3-5-sonnet-latest` |
 | `WATCHIT_OLLAMA_MODEL` | Local fallback model | `qwen2.5:7b-instruct-q4_K_M` |
 | `WATCHIT_OLLAMA_BASE_URL` | Ollama endpoint | `http://localhost:11434` |
+| `WATCHIT_VISION_JUDGE` | Send screenshots straight to the multimodal judge (anthropic provider only); Docling OCR remains the local fallback | `true` |
 | `WATCHIT_ENABLE_OCR` | Enable screenshot OCR | `true` |
 | `WATCHIT_SAVE_SCREENSHOTS` | Persist screenshots to disk | `false` |
 | `WATCHIT_LOG_LEVEL` | Python API/worker structured log level and dashboard server log level | `info` |

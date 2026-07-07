@@ -55,9 +55,13 @@ For production browser screenshots: **no long-term.** Screen text OCR wants a li
 engine (Tesseract via a thin service, PaddleOCR-server, or a hosted vision API). Better still:
 Claude is already the production judge and is **multimodal** — sending the (downscaled)
 screenshot directly to the judge model removes the OCR hop entirely, cuts a full LLM round
-trip, and improves judgment on image-heavy pages where OCR text is empty. Recommended path:
-keep Docling as the local/offline fallback, add a `vision` judge mode when
-`WATCHIT_LLM_PROVIDER=anthropic`, measure, then retire Docling from the hot path.
+trip, and improves judgment on image-heavy pages where OCR text is empty.
+
+**Status: implemented.** `WATCHIT_VISION_JUDGE` (default on) sends screenshots straight to
+the judge when `WATCHIT_LLM_PROVIDER=anthropic`; Docling remains the local/ollama fallback
+with a 20 s per-screenshot timeout. Upload side: 4 MB payload cap (413), max 3 screenshots
+(400), server-side dedup of pending upgrade jobs; the extension captures jpeg q60 downscaled
+to ≤1280 px wide.
 
 ## Logging rules for this pipeline
 Never log: image bytes, OCR text bodies, raw model responses. Log: event/job ids, screenshot

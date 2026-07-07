@@ -274,6 +274,13 @@ async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
         logger.exception("event_enqueue_failed")
         raise HTTPException(500, "internal error")
 
+# Screenshot upload limits: base64 payload cap and per-event screenshot count
+# (OCR_PIPELINE_DESIGN.md). Oversized uploads are a DoS/storage risk, not a
+# safety signal — the worker only ever reads the first 3 screenshots anyway.
+_UPGRADE_MAX_BYTES = 4 * 1024 * 1024
+_UPGRADE_MAX_SCREENSHOTS = 3
+
+
 @app.post("/v1/event/upgrade")
 async def post_event_upgrade(evt: UpgradeInput, device_ctx=Depends(require_device)):
     device = device_ctx["device"]
@@ -285,6 +292,20 @@ async def post_event_upgrade(evt: UpgradeInput, device_ctx=Depends(require_devic
     if owner_household != device["household_id"]:
         logger.warning("event_upgrade_cross_household_rejected", event_id=evt.id)
         raise HTTPException(403, "event does not belong to this device's household")
+    payload_len = len(evt.data_json or "")
+    if payload_len > _UPGRADE_MAX_BYTES:
+        logger.warning("event_upgrade_payload_too_large", event_id=evt.id, payload_bytes=payload_len)
+        raise HTTPException(413, "screenshot payload too large")
+    try:
+        shots = (orjson.loads(evt.data_json or "{}") or {}).get("screenshots_b64") or []
+    except orjson.JSONDecodeError:
+        shots = []
+    if isinstance(shots, list) and len(shots) > _UPGRADE_MAX_SCREENSHOTS:
+        raise HTTPException(400, f"at most {_UPGRADE_MAX_SCREENSHOTS} screenshots per event")
+    existing = db.find_pending_upgrade_job(evt.id)
+    if existing:
+        logger.info("event_upgrade_deduplicated", event_id=evt.id, job_id=existing["id"])
+        return {"status": "queued", "job_id": existing["id"], "event_id": evt.id, "action": "pending", "needs_ocr": False}
     try:
         event = evt.model_dump()
         event["household_id"] = device["household_id"]

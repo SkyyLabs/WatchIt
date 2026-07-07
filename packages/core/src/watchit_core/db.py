@@ -1011,6 +1011,21 @@ class Database:
             )
             return cur.fetchall()
 
+    def find_pending_upgrade_job(self, event_id: str) -> Optional[Dict[str, Any]]:
+        # Server-side upgrade dedup: one screenshot job per event at a time
+        # (SW eviction can make the extension re-upload despite its own dedup).
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, status FROM event_jobs
+                WHERE event_id=%s AND upgrade=TRUE AND status IN ('pending','processing')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (event_id,),
+            )
+            return cur.fetchone()
+
     def complete_event_job(self, job_id: str) -> None:
         now_ms = int(time.time() * 1000)
         with self._connect() as conn, conn.cursor() as cur:

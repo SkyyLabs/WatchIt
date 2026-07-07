@@ -387,11 +387,35 @@ async function getDomSample(tabId){
   }catch(_){ return ""; }
 }
 
+// Screenshots are judged by the backend (vision/OCR) — screen text survives
+// jpeg q60 fine, and capping width keeps upload payloads well under the API's
+// 4 MB limit. Downscale failure falls back to the original capture.
+const SCREENSHOT_MAX_WIDTH = 1280;
+
+async function downscaleDataUrl(dataUrl){
+  try{
+    const blob = await (await fetch(dataUrl)).blob();
+    const bitmap = await createImageBitmap(blob);
+    if(bitmap.width <= SCREENSHOT_MAX_WIDTH) return dataUrl;
+    const scale = SCREENSHOT_MAX_WIDTH / bitmap.width;
+    const canvas = new OffscreenCanvas(SCREENSHOT_MAX_WIDTH, Math.round(bitmap.height * scale));
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const out = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.6 });
+    const buf = new Uint8Array(await out.arrayBuffer());
+    let bin = "";
+    for(let i = 0; i < buf.length; i += 0x8000){
+      bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+    }
+    return `data:image/jpeg;base64,${btoa(bin)}`;
+  }catch(_){ return dataUrl; }
+}
+
 async function captureTabScreenshot(windowId){
   return new Promise((resolve)=>{
-    chrome.tabs.captureVisibleTab(windowId, { format: "png" }, (dataUrl)=>{
+    chrome.tabs.captureVisibleTab(windowId, { format: "jpeg", quality: 60 }, async (dataUrl)=>{
       if(chrome.runtime.lastError || !dataUrl) return resolve(null);
-      resolve(dataUrl.split(",")[1]); // strip prefix
+      const scaled = await downscaleDataUrl(dataUrl);
+      resolve(scaled.split(",")[1]); // strip prefix
     });
   });
 }
