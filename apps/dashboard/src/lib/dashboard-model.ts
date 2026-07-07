@@ -1,8 +1,14 @@
 import { domainFromUrl } from "./format";
 
 export type TimeRange = "today" | "7d" | "30d";
-export type DashboardView = "dashboard" | "settings" | "profile" | "children";
+export type DashboardView = "dashboard" | "settings" | "profile" | "children" | "household";
 export type DecisionAction = "allow" | "warn" | "blur" | "block" | "notify" | string;
+
+export type Household = {
+  id: string;
+  name: string;
+  role?: string;
+};
 
 export type ChildProfile = {
   id: string;
@@ -18,6 +24,7 @@ export type ChildProfile = {
 
 export type SecuritySettings = {
   parent_pin_set: boolean;
+  monitoring_enabled?: boolean;
   pin_policy: {
     min_length: number;
     max_length: number;

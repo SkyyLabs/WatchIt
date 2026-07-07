@@ -225,19 +225,29 @@ async def process_event(event: Dict[str, Any], *, upgrade: bool = False) -> Dict
     bind_log_context(event_id=event_id, household_id=household_id, child_id=event.get("child_id"), tab_id=event.get("tab_id"), upgrade=upgrade)
     logger.debug("event_processing_started", url=event.get("url"), db_event_write_ms=db_event_write_ms)
 
-    # Global + per-device pause gate: short-circuit the pipeline while paused.
+    # Global + per-device pause gate: short-circuit the pipeline while paused, or
+    # while the household-wide monitoring switch is off (kids browse unmonitored).
     pause_started = time.perf_counter()
     now_ms = int(time.time() * 1000)
+    # Prefer the browse-time snapshot taken at ingest; fall back to a live read
+    # (e.g. sync mode or older queued jobs) so the switch is still honored.
+    monitoring_snapshot = event.get("monitoring_enabled")
+    monitoring_off = (
+        not monitoring_snapshot
+        if monitoring_snapshot is not None
+        else not db.is_household_monitoring_enabled(household_id)
+    )
     paused_until = effective_pause_until(db, household_id, event.get("device_id"))
     pause_check_ms = _elapsed_ms(pause_started)
-    if paused_until and now_ms < paused_until:
+    if monitoring_off or (paused_until and now_ms < paused_until):
+        bypass_reason = "monitoring_disabled" if monitoring_off else "paused"
         log_service_event(
             "pipeline_bypassed_paused",
-            {"event_id": event_id, "child_id": event.get("child_id"), "paused_until_ms": paused_until},
+            {"event_id": event_id, "child_id": event.get("child_id"), "paused_until_ms": paused_until, "reason": bypass_reason},
         )
-        logger.debug("pipeline_bypassed_paused", paused_until_ms=paused_until, pause_check_ms=pause_check_ms)
+        logger.debug("pipeline_bypassed_paused", paused_until_ms=paused_until, pause_check_ms=pause_check_ms, reason=bypass_reason)
         log_step("event_received", event, {"upgrade": upgrade, "paused": True})
-        decision = {"action": "allow", "reason": "paused", "categories": []}
+        decision = {"action": "allow", "reason": bypass_reason, "categories": []}
         confidence = 1.0
         decision_write_started = time.perf_counter()
         decision_id = db.add_decision(

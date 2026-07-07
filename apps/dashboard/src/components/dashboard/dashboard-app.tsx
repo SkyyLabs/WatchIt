@@ -12,6 +12,7 @@ import {
   CircleGauge,
   Download,
   Eye,
+  Home,
   KeyRound,
   Lock,
   Menu,
@@ -51,6 +52,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ChildrenView } from "@/components/dashboard/children-view";
+import { HouseholdView } from "@/components/dashboard/household-view";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -417,6 +419,8 @@ export function DashboardApp({ initialView = "dashboard" }: DashboardAppProps) {
               onStartMonitoring={startMonitoringForChild}
               onStopMonitoring={stopMonitoringForChild}
             />
+          ) : initialView === "household" ? (
+            <HouseholdView />
           ) : (
             <HomeDashboardView
               needsOnboarding={needsOnboarding}
@@ -506,9 +510,27 @@ function SignedOut() {
 const NAV_ITEMS = [
   { view: "dashboard", href: "/", label: "Dashboard", icon: CircleGauge },
   { view: "children", href: "/children", label: "Children", icon: Users },
+  { view: "household", href: "/household", label: "Households", icon: Home },
   { view: "settings", href: "/settings", label: "Settings", icon: Settings },
   { view: "profile", href: "/profile", label: "Profile", icon: UserRound },
 ] as const;
+
+function HouseholdSwitcher() {
+  const { households, selectedHousehold, setSelectedHousehold } = useDashboardData();
+  if (households.length === 0) return null;
+  return (
+    <Select value={selectedHousehold || ""} onValueChange={setSelectedHousehold}>
+      <SelectTrigger className="w-full" aria-label="Select household">
+        <SelectValue placeholder="Select household" />
+      </SelectTrigger>
+      <SelectContent>
+        {households.map((household) => (
+          <SelectItem key={household.id} value={household.id}>{household.name}</SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
 
 function Brand() {
   return (
@@ -558,6 +580,9 @@ function AppShell({ activeView, userName, children }: { activeView: DashboardRou
         <div className="border-b border-sidebar-border p-4">
           <Brand />
         </div>
+        <div className="border-b border-sidebar-border p-3">
+          <HouseholdSwitcher />
+        </div>
         <SidebarNav activeView={activeView} />
       </aside>
 
@@ -573,6 +598,9 @@ function AppShell({ activeView, userName, children }: { activeView: DashboardRou
               <SheetTitle className="sr-only">Navigation</SheetTitle>
               <div className="border-b border-sidebar-border p-4">
                 <Brand />
+              </div>
+              <div className="border-b border-sidebar-border p-3">
+                <HouseholdSwitcher />
               </div>
               <SidebarNav activeView={activeView} onNavigate={() => setNavOpen(false)} />
             </SheetContent>

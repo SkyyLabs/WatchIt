@@ -37,6 +37,20 @@ def _resolve_household(claims: Dict[str, Any]) -> Dict[str, Any]:
     return context
 
 
+def _select_active_household(context: Dict[str, Any], requested_id: str | None) -> Dict[str, Any]:
+    # The dashboard picks the active household via X-Household-Id (or the `household`
+    # stream query param). Validate it against the guardian's memberships every
+    # request — never trust a client-supplied id. Unknown/unowned → default household.
+    default_household = context["household"]
+    if not requested_id or requested_id == default_household.get("id"):
+        return context
+    households = db.list_guardian_households(context["guardian"]["id"])
+    match = next((h for h in households if h["id"] == requested_id), None)
+    if not match:
+        return context
+    return {**context, "household": dict(match)}
+
+
 def _jwks_client_for_settings() -> jwt.PyJWKClient:
     global _jwks_client
     jwks_url = settings.clerk_jwks_url
@@ -68,12 +82,15 @@ def verify_clerk_token(token: str) -> Dict[str, Any]:
 
 # Sync def so FastAPI runs it (and its blocking DB work on cache miss) in a
 # threadpool instead of on the event loop, keeping read endpoints concurrent.
-def require_guardian(authorization: str | None = Header(default=None)) -> Dict[str, Any]:
+def require_guardian(
+    authorization: str | None = Header(default=None),
+    x_household_id: str | None = Header(default=None, alias="X-Household-Id"),
+) -> Dict[str, Any]:
     if not authorization or not authorization.lower().startswith("bearer "):
         logger.warning("guardian_auth_missing")
         raise HTTPException(401, "Missing bearer token")
     claims = verify_clerk_token(authorization.split(" ", 1)[1].strip())
-    context = _resolve_household(claims)
+    context = _select_active_household(_resolve_household(claims), x_household_id)
     bind_log_context(
         guardian_id=context["guardian"].get("id"),
         household_id=context["household"].get("id"),
@@ -81,12 +98,15 @@ def require_guardian(authorization: str | None = Header(default=None)) -> Dict[s
     return {**claims, **context}
 
 
-async def require_guardian_stream(token: str | None = Query(default=None)) -> Dict[str, Any]:
+async def require_guardian_stream(
+    token: str | None = Query(default=None),
+    household: str | None = Query(default=None),
+) -> Dict[str, Any]:
     if not token:
         logger.warning("guardian_stream_auth_missing")
         raise HTTPException(401, "Missing stream token")
     claims = verify_clerk_token(token)
-    context = _resolve_household(claims)
+    context = _select_active_household(_resolve_household(claims), household)
     bind_log_context(
         guardian_id=context["guardian"].get("id"),
         household_id=context["household"].get("id"),

@@ -3,12 +3,13 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
 
-import { apiFetch, decisionStreamUrl } from "@/lib/api-client";
+import { apiFetch, decisionStreamUrl, setActiveHousehold } from "@/lib/api-client";
 import { clientLogger, startClientLogShipping } from "@/lib/client-logger";
 import {
   ChildProfile,
   DecisionRecord,
   EventRecord,
+  Household,
   normalizeDecision,
   SecuritySettings,
 } from "@/lib/dashboard-model";
@@ -17,6 +18,10 @@ type DashboardData = {
   isLoaded: boolean;
   isSignedIn: boolean;
   token: () => Promise<string | null>;
+
+  households: Household[];
+  selectedHousehold: string | null;
+  setSelectedHousehold: (id: string) => void;
 
   children: ChildProfile[];
   activeChildId: string | null;
@@ -49,6 +54,8 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
   const { isLoaded, isSignedIn, getToken } = useAuth();
   const token = useCallback(() => getToken(), [getToken]);
 
+  const [households, setHouseholds] = useState<Household[]>([]);
+  const [selectedHousehold, setSelectedHouseholdState] = useState<string | null>(null);
   const [childList, setChildList] = useState<ChildProfile[]>([]);
   const [activeChildId, setActiveChildId] = useState<string | null>(null);
   const [selectedChild, setSelectedChild] = useState<string | null>(null);
@@ -67,10 +74,21 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     setCoreLoading(true);
     try {
       const authToken = await token();
-      const [childrenResp, securityResp] = await Promise.all([
+      const [householdsResp, childrenResp, securityResp] = await Promise.all([
+        apiFetch<{ households: Household[]; active_household_id: string | null }>("/v1/households", authToken),
         apiFetch<{ children: ChildProfile[]; active_child_id: string | null }>("/v1/children", authToken),
         apiFetch<SecuritySettings>("/v1/settings/security", authToken),
       ]);
+      const householdList = householdsResp.households || [];
+      setHouseholds(householdList);
+      setSelectedHouseholdState((previous) => {
+        const next =
+          previous && householdList.some((h) => h.id === previous)
+            ? previous
+            : householdsResp.active_household_id || householdList[0]?.id || null;
+        setActiveHousehold(next);
+        return next;
+      });
       const list = childrenResp.children || [];
       setChildList(list);
       setActiveChildId(childrenResp.active_child_id || null);
@@ -120,6 +138,23 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
     void refreshActivity();
   }, [refreshActivity]);
 
+  const setSelectedHousehold = useCallback(
+    (id: string) => {
+      setSelectedHouseholdState((previous) => {
+        if (previous === id) return previous;
+        setActiveHousehold(id);
+        // Reload everything scoped to the newly selected household. Refetch
+        // activity only if it was already loaded (dashboard view has been shown).
+        const hadActivity = activityRequested.current;
+        setSelectedChild(null);
+        void refreshCore();
+        if (hadActivity) void refreshActivity();
+        return id;
+      });
+    },
+    [refreshCore, refreshActivity],
+  );
+
   // Ship buffered client logs to the backend (for the log drain) once signed in.
   useEffect(() => {
     if (!isSignedIn) return;
@@ -128,6 +163,9 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
 
   useEffect(() => {
     if (!isSignedIn) {
+      setHouseholds([]);
+      setSelectedHouseholdState(null);
+      setActiveHousehold(null);
       setChildList([]);
       setDecisions([]);
       setEvents([]);
@@ -175,12 +213,15 @@ export function DashboardDataProvider({ children }: { children: React.ReactNode 
       cancelled = true;
       if (es) es.close();
     };
-  }, [isSignedIn, token]);
+  }, [isSignedIn, token, selectedHousehold]);
 
   const value: DashboardData = {
     isLoaded,
     isSignedIn,
     token,
+    households,
+    selectedHousehold,
+    setSelectedHousehold,
     children: childList,
     activeChildId,
     selectedChild,

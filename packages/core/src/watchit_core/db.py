@@ -152,6 +152,77 @@ class Database:
                 )
             return {"guardian": guardian, "household": household}
 
+    def list_guardian_households(self, guardian_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT h.id, h.name, hm.role, hm.created_at AS joined_at
+                FROM households h
+                JOIN household_members hm ON hm.household_id=h.id
+                WHERE hm.guardian_id=%s
+                ORDER BY hm.created_at ASC
+                """,
+                (guardian_id,),
+            )
+            return cur.fetchall()
+
+    def create_household(self, guardian_id: str, name: str) -> Dict[str, Any]:
+        household_id = self._new_id("hh")
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO households(id, name) VALUES (%s, %s) RETURNING *",
+                (household_id, name),
+            )
+            household = cur.fetchone()
+            cur.execute(
+                """
+                INSERT INTO household_members(id, household_id, guardian_id, role)
+                VALUES (%s, %s, %s, 'owner')
+                ON CONFLICT (household_id, guardian_id) DO NOTHING
+                """,
+                (self._new_id("hm"), household_id, guardian_id),
+            )
+            return household
+
+    def guardian_in_household(self, guardian_id: str, household_id: str) -> bool:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM household_members WHERE guardian_id=%s AND household_id=%s",
+                (guardian_id, household_id),
+            )
+            return cur.fetchone() is not None
+
+    def move_child(self, child_id: str, from_household_id: str, to_household_id: str) -> bool:
+        # Reassign the child and everything the extension/monitoring path scopes by
+        # household (devices carry the auth-derived household_id; sessions mirror it).
+        # Historical events/decisions stay with the old household as an audit trail.
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE children SET household_id=%s, updated_at=now() WHERE id=%s AND household_id=%s",
+                (to_household_id, child_id, from_household_id),
+            )
+            if cur.rowcount == 0:
+                return False
+            cur.execute(
+                "UPDATE devices SET household_id=%s, updated_at=now() WHERE child_id=%s AND household_id=%s",
+                (to_household_id, child_id, from_household_id),
+            )
+            cur.execute(
+                "UPDATE monitoring_sessions SET household_id=%s WHERE child_id=%s AND household_id=%s",
+                (to_household_id, child_id, from_household_id),
+            )
+            # Outstanding (unredeemed) pairing codes carry the source household_id;
+            # redeem_pairing_code trusts it, so move them too or a pre-move code would
+            # pair the child's browser back into the old household.
+            cur.execute(
+                """
+                UPDATE device_pairing_codes SET household_id=%s
+                WHERE child_id=%s AND household_id=%s AND redeemed_at IS NULL
+                """,
+                (to_household_id, child_id, from_household_id),
+            )
+            return True
+
     def log_audit(
         self,
         household_id: str,
@@ -257,6 +328,24 @@ class Database:
                 )
             else:
                 cur.execute(f"SELECT {columns} FROM children c ORDER BY c.created_at ASC")
+            return cur.fetchall()
+
+    def fetch_guardian_children(self, guardian_id: str) -> List[Dict[str, Any]]:
+        # Children across every household the guardian belongs to, tagged with the
+        # household name — powers the household view's move-in / move-out lists.
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.id, c.household_id, h.name AS household_name,
+                       c.name, c.strictness, c.age, c.status
+                FROM children c
+                JOIN household_members hm ON hm.household_id=c.household_id
+                JOIN households h ON h.id=c.household_id
+                WHERE hm.guardian_id=%s
+                ORDER BY h.name ASC, c.created_at ASC
+                """,
+                (guardian_id,),
+            )
             return cur.fetchall()
 
     def fetch_devices(self, household_id: str, child_id: str) -> List[Dict[str, Any]]:
@@ -779,6 +868,18 @@ class Database:
                 (self._new_id("hset"), household_id, key, Json(value), guardian_id),
             )
 
+    def is_household_monitoring_enabled(self, household_id: str = "hh_legacy") -> bool:
+        # Household-wide monitoring switch. Absent setting => enabled by default.
+        setting = self.get_household_setting_json("monitoring_enabled", household_id)
+        if not setting:
+            return True
+        return bool(setting.get("enabled", True))
+
+    def set_household_monitoring_enabled(
+        self, enabled: bool, household_id: str = "hh_legacy", guardian_id: Optional[str] = None
+    ) -> None:
+        self.set_household_setting_json("monitoring_enabled", {"enabled": bool(enabled)}, household_id, guardian_id)
+
     def is_parent_pin_set(self, household_id: str = "hh_legacy") -> bool:
         pin = self.get_household_setting_json(self.PARENT_PIN_KEY, household_id)
         return bool(
@@ -885,6 +986,14 @@ class Database:
             pairing = cur.fetchone()
             if not pairing:
                 return None
+            # Same physical device (unique install_id) may already be paired to
+            # another child. Capture the prior owner before the upsert overwrites it
+            # so we can stop its stale session and audit the reassignment.
+            cur.execute(
+                "SELECT id, child_id, household_id FROM devices WHERE install_id=%s",
+                (install_id,),
+            )
+            prior = cur.fetchone()
             cur.execute(
                 """
                 INSERT INTO devices(
@@ -918,7 +1027,25 @@ class Database:
                 ),
             )
             device = cur.fetchone()
-        return {"device": device, "device_token": device_token}
+            reassigned = None
+            if prior and prior["child_id"] != pairing["child_id"]:
+                # Stop the previous child's active session for this exact device
+                # (scoped by device_id so the child's other devices keep running).
+                cur.execute(
+                    """
+                    UPDATE monitoring_sessions
+                    SET status='stopped', stopped_at=now(), stop_reason='device_reassigned'
+                    WHERE child_id=%s AND device_id=%s AND status='active'
+                    """,
+                    (prior["child_id"], prior["id"]),
+                )
+                reassigned = {
+                    "from_child_id": prior["child_id"],
+                    "from_household_id": prior["household_id"],
+                    "to_child_id": pairing["child_id"],
+                    "to_household_id": pairing["household_id"],
+                }
+        return {"device": device, "device_token": device_token, "reassigned": reassigned}
 
     def authenticate_device_token(self, token: str) -> Optional[Dict[str, Any]]:
         token_hash = self._token_hash(token)
