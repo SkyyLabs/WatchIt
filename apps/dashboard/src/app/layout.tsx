@@ -1,5 +1,6 @@
 import { ClerkProvider } from "@clerk/nextjs";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { DashboardDataProvider } from "@/lib/dashboard-data";
 import { serverLogger } from "../lib/server-logger";
 import "./globals.css";
 
@@ -17,9 +18,11 @@ export default function RootLayout({
 
   return (
     <ClerkProvider>
-      <html lang="en" className="dark font-sans">
+      <html lang="en" className="font-sans">
         <body className="antialiased">
-          <TooltipProvider>{children}</TooltipProvider>
+          <TooltipProvider>
+            <DashboardDataProvider>{children}</DashboardDataProvider>
+          </TooltipProvider>
         </body>
       </html>
     </ClerkProvider>

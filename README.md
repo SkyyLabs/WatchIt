@@ -161,15 +161,25 @@ The worker host is simply the platform that runs background processing outside H
 ## Logging
 
 - Dashboard server-side logs use Pino and print structured JSON to stdout.
-- Python API and worker logs use `structlog` and print structured JSON to stdout.
+- Python API and worker logs use `structlog` and print structured JSON to stdout. Emission is asynchronous (a background `QueueListener` does the stdout write) so log calls add no request/pipeline latency.
 - API request logs include request ID, method, path, status, and duration.
 - Worker logs include job claim/start/complete/failure, queue wait time, processing duration, event IDs, OCR requests, decisions, and model lifecycle events.
 - Pipeline timing logs include database write, pause check, profile load, cache lookup, graph, analysis writes, policy, decision write, cache write, publish, and total duration.
 - URL decision cache logs emit cache hit/miss/store/update events with normalized URL and cache key.
-- Dashboard client-side logs print through `console.log`/`console.warn`/`console.error`.
-- Client logs are also persisted in browser `localStorage` as recent JSON entries and can be downloaded from the dashboard with **Export logs**.
-- Detailed agent trace files are opt-in with `WATCHIT_AGENT_TRACE_FILES=true`.
-- A log drain is intentionally not configured yet.
+- Dashboard client-side logs do **not** print to the browser console. They are buffered in `localStorage` (downloadable via **Export logs**) and shipped asynchronously to the backend via `POST /v1/client-logs`, where they are re-emitted as structured JSON with `service=dashboard-client` — so a single stdout drain captures browser logs too.
+- Detailed agent trace files are opt-in with `WATCHIT_AGENT_TRACE_FILES=true` (per-session files under `logs/sessions/`).
+- **Log drain:** all backend and (re-emitted) client logs are JSON on stdout — point a drain (Vector, Fluent Bit, Datadog agent, etc.) at the API/worker stdout. No drain is wired by default.
+
+### Key event names to grep
+
+| Meaning | Event | Level |
+| --- | --- | --- |
+| Website accessed | `event_processing_started` | info |
+| LLM engaged | `llm_judge_started` / `llm_provider_selected` | info |
+| LLM succeeded | `llm_judge_finished` | info |
+| OCR needed | `ocr_requested` | info |
+| Policy decision rendered | `decision_created` | info |
+| Errors | `llm_call_failed`, `event_job_failed`, `request_failed` | error |
 
 ## Development Notes
 

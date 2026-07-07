@@ -6,6 +6,14 @@ export type ApiError = Error & {
   detail?: string;
 };
 
+// The selected household scopes every guardian request via X-Household-Id.
+// Held module-level so callers don't thread it through each apiFetch; the
+// dashboard data provider updates it when the guardian switches households.
+let activeHouseholdId: string | null = null;
+export function setActiveHousehold(id: string | null) {
+  activeHouseholdId = id;
+}
+
 export async function apiFetch<T>(
   path: string,
   token: string | null,
@@ -13,6 +21,7 @@ export async function apiFetch<T>(
 ): Promise<T> {
   const headers = new Headers(init.headers);
   if (token) headers.set("authorization", `Bearer ${token}`);
+  if (activeHouseholdId) headers.set("X-Household-Id", activeHouseholdId);
   if (init.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
@@ -34,6 +43,9 @@ export async function apiFetch<T>(
 }
 
 export function decisionStreamUrl(token: string | null): string {
-  const qs = token ? `?token=${encodeURIComponent(token)}` : "";
-  return `${API_BASE_URL}/v1/stream/decisions${qs}`;
+  const params = new URLSearchParams();
+  if (token) params.set("token", token);
+  if (activeHouseholdId) params.set("household", activeHouseholdId);
+  const qs = params.toString();
+  return `${API_BASE_URL}/v1/stream/decisions${qs ? `?${qs}` : ""}`;
 }

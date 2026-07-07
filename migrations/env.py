@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from logging.config import fileConfig
 
 from alembic import context
@@ -9,7 +10,11 @@ from watchit_core.config import settings
 
 config = context.config
 
-if config.config_file_name is not None:
+# Only let Alembic reconfigure logging for the standalone `alembic` CLI (no root
+# handlers yet). When the API/worker run migrations on startup, structlog has
+# already configured the root handler — fileConfig would replace it with
+# Alembic's plain-text handler and mangle all subsequent JSON logs.
+if config.config_file_name is not None and not logging.getLogger().handlers:
     fileConfig(config.config_file_name)
 
 target_metadata = None

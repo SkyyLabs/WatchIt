@@ -7,7 +7,7 @@ from watchit_core.policy.engine import PolicyEngine
 
 
 class PolicyAgent:
-    """Wraps PolicyEngine.decide as an agent callable from the planner loop."""
+    """Wraps PolicyEngine.decide as the graph's terminal decision node."""
 
     def __init__(self):
         self.engine = PolicyEngine()
@@ -20,10 +20,7 @@ class PolicyAgent:
             child_profile,
             state.headline_result,
         )
-        # Attach final decision back to state-compatible payload
-        output = {
-            "decision": decision,
-        }
+        output = {"decision": decision}
         log_agent_step(
             "PolicyAgent",
             "decide",
@@ -34,7 +31,7 @@ class PolicyAgent:
                 "headline_result": state.headline_result,
             },
             output,
-            {"loop_count": state.loop_count},
+            {"last_tool_run": getattr(state, "last_tool_run", "")},
             f"policy action={decision.get('action')}",
         )
         return decision

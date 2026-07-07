@@ -10,9 +10,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-import psycopg
+import threading
+
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
+from psycopg_pool import ConnectionPool
 
 from watchit_core.config import settings
 from watchit_core.migrations import run_migrations
@@ -28,15 +30,44 @@ class Database:
 
     def __init__(self, dsn: Optional[str] = None):
         self.dsn = dsn
+        self._pool: ConnectionPool | None = None
+        self._pool_lock = threading.Lock()
 
     def connect(self) -> None:
         run_migrations(self.dsn)
 
+    def _get_pool(self) -> ConnectionPool:
+        if self._pool is None:
+            with self._pool_lock:
+                if self._pool is None:
+                    dsn = self.dsn or settings.database_url
+                    if not dsn:
+                        raise RuntimeError("DATABASE_URL is required")
+                    # Pooled connections avoid a fresh TCP+TLS handshake to Neon on
+                    # every query. check_connection validates a conn before handing
+                    # it out so idle Neon connections that dropped are recycled.
+                    pool = ConnectionPool(
+                        dsn,
+                        min_size=1,
+                        max_size=10,
+                        kwargs={"row_factory": dict_row},
+                        check=ConnectionPool.check_connection,
+                        open=False,
+                    )
+                    pool.open()
+                    self._pool = pool
+        return self._pool
+
     def _connect(self):
-        dsn = self.dsn or settings.database_url
-        if not dsn:
-            raise RuntimeError("DATABASE_URL is required")
-        return psycopg.connect(dsn, row_factory=dict_row)
+        # Returns a context manager that yields a pooled connection and returns it
+        # to the pool on exit (commit on success, rollback on error) — same
+        # `with self._connect() as conn` call sites as before.
+        return self._get_pool().connection()
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
 
     def init_schema(self) -> None:
         """Compatibility wrapper. Schema is owned by Alembic."""
@@ -121,6 +152,77 @@ class Database:
                 )
             return {"guardian": guardian, "household": household}
 
+    def list_guardian_households(self, guardian_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT h.id, h.name, hm.role, hm.created_at AS joined_at
+                FROM households h
+                JOIN household_members hm ON hm.household_id=h.id
+                WHERE hm.guardian_id=%s
+                ORDER BY hm.created_at ASC
+                """,
+                (guardian_id,),
+            )
+            return cur.fetchall()
+
+    def create_household(self, guardian_id: str, name: str) -> Dict[str, Any]:
+        household_id = self._new_id("hh")
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO households(id, name) VALUES (%s, %s) RETURNING *",
+                (household_id, name),
+            )
+            household = cur.fetchone()
+            cur.execute(
+                """
+                INSERT INTO household_members(id, household_id, guardian_id, role)
+                VALUES (%s, %s, %s, 'owner')
+                ON CONFLICT (household_id, guardian_id) DO NOTHING
+                """,
+                (self._new_id("hm"), household_id, guardian_id),
+            )
+            return household
+
+    def guardian_in_household(self, guardian_id: str, household_id: str) -> bool:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM household_members WHERE guardian_id=%s AND household_id=%s",
+                (guardian_id, household_id),
+            )
+            return cur.fetchone() is not None
+
+    def move_child(self, child_id: str, from_household_id: str, to_household_id: str) -> bool:
+        # Reassign the child and everything the extension/monitoring path scopes by
+        # household (devices carry the auth-derived household_id; sessions mirror it).
+        # Historical events/decisions stay with the old household as an audit trail.
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE children SET household_id=%s, updated_at=now() WHERE id=%s AND household_id=%s",
+                (to_household_id, child_id, from_household_id),
+            )
+            if cur.rowcount == 0:
+                return False
+            cur.execute(
+                "UPDATE devices SET household_id=%s, updated_at=now() WHERE child_id=%s AND household_id=%s",
+                (to_household_id, child_id, from_household_id),
+            )
+            cur.execute(
+                "UPDATE monitoring_sessions SET household_id=%s WHERE child_id=%s AND household_id=%s",
+                (to_household_id, child_id, from_household_id),
+            )
+            # Outstanding (unredeemed) pairing codes carry the source household_id;
+            # redeem_pairing_code trusts it, so move them too or a pre-move code would
+            # pair the child's browser back into the old household.
+            cur.execute(
+                """
+                UPDATE device_pairing_codes SET household_id=%s
+                WHERE child_id=%s AND household_id=%s AND redeemed_at IS NULL
+                """,
+                (to_household_id, child_id, from_household_id),
+            )
+            return True
+
     def log_audit(
         self,
         household_id: str,
@@ -204,20 +306,192 @@ class Database:
             cur.execute(f"UPDATE children SET {', '.join(updates)} WHERE {where}", params)
 
     def fetch_children(self, household_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        # monitoring_active / active_device_count let the children UI reflect live
+        # state on load without an extra fetch per child.
+        columns = """
+            c.id, c.household_id, c.name, c.timezone, c.strictness, c.age, c.status,
+            c.created_at, c.updated_at,
+            EXISTS(
+                SELECT 1 FROM monitoring_sessions ms
+                WHERE ms.household_id=c.household_id AND ms.child_id=c.id AND ms.status='active'
+            ) AS monitoring_active,
+            (
+                SELECT COUNT(*) FROM devices d
+                WHERE d.household_id=c.household_id AND d.child_id=c.id AND d.status='active'
+            ) AS active_device_count
+        """
         with self._connect() as conn, conn.cursor() as cur:
             if household_id:
                 cur.execute(
-                    """
-                    SELECT id, household_id, name, timezone, strictness, age, status, created_at, updated_at
-                    FROM children
-                    WHERE household_id=%s
-                    ORDER BY created_at ASC
-                    """,
+                    f"SELECT {columns} FROM children c WHERE c.household_id=%s ORDER BY c.created_at ASC",
                     (household_id,),
                 )
             else:
-                cur.execute("SELECT id, household_id, name, timezone, strictness, age, status, created_at, updated_at FROM children ORDER BY created_at ASC")
+                cur.execute(f"SELECT {columns} FROM children c ORDER BY c.created_at ASC")
             return cur.fetchall()
+
+    def fetch_guardian_children(self, guardian_id: str) -> List[Dict[str, Any]]:
+        # Children across every household the guardian belongs to, tagged with the
+        # household name — powers the household view's move-in / move-out lists.
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.id, c.household_id, h.name AS household_name,
+                       c.name, c.strictness, c.age, c.status
+                FROM children c
+                JOIN household_members hm ON hm.household_id=c.household_id
+                JOIN households h ON h.id=c.household_id
+                WHERE hm.guardian_id=%s
+                ORDER BY h.name ASC, c.created_at ASC
+                """,
+                (guardian_id,),
+            )
+            return cur.fetchall()
+
+    # --- Quiet-hours schedules -------------------------------------------------
+    # quiet_start/quiet_end are TIME columns; read them back as "HH:MM" strings so
+    # the API and the worker policy gate don't juggle datetime.time objects.
+    _SCHEDULE_COLUMNS = (
+        "id, household_id, child_id, device_id, name, days, "
+        "to_char(quiet_start, 'HH24:MI') AS quiet_start, "
+        "to_char(quiet_end, 'HH24:MI') AS quiet_end, timezone, enabled"
+    )
+
+    def list_schedules(self, household_id: str, child_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {self._SCHEDULE_COLUMNS} FROM child_schedules "
+                "WHERE household_id=%s AND child_id=%s "
+                "ORDER BY device_id NULLS FIRST, created_at ASC",
+                (household_id, child_id),
+            )
+            return cur.fetchall()
+
+    def upsert_schedule(
+        self,
+        household_id: str,
+        child_id: str,
+        days: str,
+        quiet_start: str,
+        quiet_end: str,
+        *,
+        device_id: Optional[str] = None,
+        name: str = "Quiet hours",
+        enabled: bool = True,
+        timezone: Optional[str] = None,
+        schedule_id: Optional[str] = None,
+    ) -> str:
+        with self._connect() as conn, conn.cursor() as cur:
+            if schedule_id:
+                cur.execute(
+                    """
+                    UPDATE child_schedules
+                    SET device_id=%s, name=%s, days=%s, quiet_start=%s, quiet_end=%s,
+                        timezone=%s, enabled=%s, updated_at=now()
+                    WHERE id=%s AND household_id=%s
+                    RETURNING id
+                    """,
+                    (device_id, name, days, quiet_start, quiet_end, timezone, enabled, schedule_id, household_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row["id"]
+            new_id = self._new_id("sch")
+            cur.execute(
+                """
+                INSERT INTO child_schedules(id, household_id, child_id, device_id, name, days, quiet_start, quiet_end, timezone, enabled)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (new_id, household_id, child_id, device_id, name, days, quiet_start, quiet_end, timezone, enabled),
+            )
+            return cur.fetchone()["id"]
+
+    def delete_schedule(self, schedule_id: str, household_id: str) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM child_schedules WHERE id=%s AND household_id=%s",
+                (schedule_id, household_id),
+            )
+            return cur.rowcount
+
+    def get_effective_quiet_schedules(
+        self, household_id: str, child_id: str, device_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        # Return every enabled window that applies, so the caller can match any of
+        # them (a child may have e.g. separate weekday/weekend windows). Device-level
+        # windows override the child defaults entirely when present. timezone falls
+        # back to the child profile's timezone so windows evaluate in local time.
+        cols = (
+            "cs.id, cs.household_id, cs.child_id, cs.device_id, cs.name, cs.days, "
+            "to_char(cs.quiet_start, 'HH24:MI') AS quiet_start, "
+            "to_char(cs.quiet_end, 'HH24:MI') AS quiet_end, "
+            "COALESCE(NULLIF(cs.timezone, ''), NULLIF(c.timezone, '')) AS timezone, cs.enabled"
+        )
+        base = (
+            f"SELECT {cols} FROM child_schedules cs JOIN children c ON c.id=cs.child_id "
+            "WHERE cs.household_id=%s AND cs.child_id=%s AND cs.enabled=TRUE"
+        )
+        with self._connect() as conn, conn.cursor() as cur:
+            if device_id:
+                cur.execute(
+                    base + " AND cs.device_id=%s ORDER BY cs.created_at ASC",
+                    (household_id, child_id, device_id),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    return rows
+            cur.execute(
+                base + " AND cs.device_id IS NULL ORDER BY cs.created_at ASC",
+                (household_id, child_id),
+            )
+            return cur.fetchall()
+
+    def fetch_devices(self, household_id: str, child_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, child_id, device_name, browser_name, status,
+                       last_seen_at, paused_until, created_at
+                FROM devices
+                WHERE household_id=%s AND child_id=%s AND status<>'revoked'
+                ORDER BY created_at DESC
+                """,
+                (household_id, child_id),
+            )
+            return cur.fetchall()
+
+    def get_device_paused_until(self, device_id: str) -> Optional[int]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT paused_until FROM devices WHERE id=%s", (device_id,))
+            row = cur.fetchone()
+            return row["paused_until"] if row else None
+
+    def set_device_pause(self, household_id: str, device_id: str, paused_until_ms: int) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET paused_until=%s, updated_at=now() WHERE id=%s AND household_id=%s",
+                (paused_until_ms, device_id, household_id),
+            )
+            return cur.rowcount
+
+    def clear_device_pause(self, household_id: str, device_id: str) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET paused_until=NULL, updated_at=now() WHERE id=%s AND household_id=%s",
+                (device_id, household_id),
+            )
+            return cur.rowcount
+
+    def revoke_device(self, household_id: str, device_id: str) -> int:
+        # Revoking retires a stale/duplicate device: it drops out of the list and its
+        # token stops authenticating (authenticate_device_token requires status='active').
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET status='revoked', updated_at=now() WHERE id=%s AND household_id=%s AND status<>'revoked'",
+                (device_id, household_id),
+            )
+            return cur.rowcount
 
     def add_event(self, event: Dict[str, Any]) -> str:
         event_id = event.get("id") or f"evt_{uuid.uuid4().hex}"
@@ -548,6 +822,42 @@ class Database:
             )
             return cur.fetchone()
 
+    def get_decision_by_event(self, event_id: str, household_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Latest decision for an event, scoped to a household. Used by the
+        extension to poll for the enforcement decision it must apply."""
+        with self._connect() as conn, conn.cursor() as cur:
+            params: List[Any] = [event_id]
+            scope = ""
+            if household_id:
+                params.append(household_id)
+                scope = " AND d.household_id=%s"
+            cur.execute(
+                f"""
+                SELECT
+                    d.*,
+                    COALESCE(o.action, d.action) AS action,
+                    o.action AS manual_action,
+                    (o.id IS NOT NULL) AS manual_flagged,
+                    EXTRACT(EPOCH FROM o.created_at) * 1000 AS manual_updated_at,
+                    e.url, e.title, e.ts, e.child_id, e.tab_id, e.device_id, e.session_id
+                FROM decisions d
+                JOIN events e ON d.event_id=e.id
+                LEFT JOIN LATERAL (
+                    SELECT *
+                    FROM decision_overrides o
+                    WHERE o.decision_id=d.id
+                    ORDER BY o.created_at DESC
+                    LIMIT 1
+                ) o ON TRUE
+                WHERE d.event_id=%s
+                {scope}
+                ORDER BY d.created_at DESC
+                LIMIT 1
+                """,
+                params,
+            )
+            return cur.fetchone()
+
     def override_decision(
         self,
         decision_id: str,
@@ -657,6 +967,18 @@ class Database:
                 (self._new_id("hset"), household_id, key, Json(value), guardian_id),
             )
 
+    def is_household_monitoring_enabled(self, household_id: str = "hh_legacy") -> bool:
+        # Household-wide monitoring switch. Absent setting => enabled by default.
+        setting = self.get_household_setting_json("monitoring_enabled", household_id)
+        if not setting:
+            return True
+        return bool(setting.get("enabled", True))
+
+    def set_household_monitoring_enabled(
+        self, enabled: bool, household_id: str = "hh_legacy", guardian_id: Optional[str] = None
+    ) -> None:
+        self.set_household_setting_json("monitoring_enabled", {"enabled": bool(enabled)}, household_id, guardian_id)
+
     def is_parent_pin_set(self, household_id: str = "hh_legacy") -> bool:
         pin = self.get_household_setting_json(self.PARENT_PIN_KEY, household_id)
         return bool(
@@ -763,6 +1085,14 @@ class Database:
             pairing = cur.fetchone()
             if not pairing:
                 return None
+            # Same physical device (unique install_id) may already be paired to
+            # another child. Capture the prior owner before the upsert overwrites it
+            # so we can stop its stale session and audit the reassignment.
+            cur.execute(
+                "SELECT id, child_id, household_id FROM devices WHERE install_id=%s",
+                (install_id,),
+            )
+            prior = cur.fetchone()
             cur.execute(
                 """
                 INSERT INTO devices(
@@ -796,7 +1126,25 @@ class Database:
                 ),
             )
             device = cur.fetchone()
-        return {"device": device, "device_token": device_token}
+            reassigned = None
+            if prior and prior["child_id"] != pairing["child_id"]:
+                # Stop the previous child's active session for this exact device
+                # (scoped by device_id so the child's other devices keep running).
+                cur.execute(
+                    """
+                    UPDATE monitoring_sessions
+                    SET status='stopped', stopped_at=now(), stop_reason='device_reassigned'
+                    WHERE child_id=%s AND device_id=%s AND status='active'
+                    """,
+                    (prior["child_id"], prior["id"]),
+                )
+                reassigned = {
+                    "from_child_id": prior["child_id"],
+                    "from_household_id": prior["household_id"],
+                    "to_child_id": pairing["child_id"],
+                    "to_household_id": pairing["household_id"],
+                }
+        return {"device": device, "device_token": device_token, "reassigned": reassigned}
 
     def authenticate_device_token(self, token: str) -> Optional[Dict[str, Any]]:
         token_hash = self._token_hash(token)

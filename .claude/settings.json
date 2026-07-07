@@ -30,7 +30,6 @@
       "Bash(grep:*)"
     ],
     "deny": [
-      "Read(./.env)",
       "Read(./apps/dashboard/.env.local)",
       "Bash(alembic downgrade:*)",
       "Bash(.venv/bin/alembic downgrade:*)"

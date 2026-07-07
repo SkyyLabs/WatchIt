@@ -55,15 +55,9 @@ class PolicyEngine:
         child_profile: Dict[str, Any] | None = None,
         headline_result: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
-        # Schedule in the child's configured timezone.
-        now = _schedule_now(child_profile)
-        if _in_quiet_hours(now, settings.sched_days, settings.sched_quiet):
-            # During quiet hours, allow only educational domains; block others
-            url = event.get("url") or ""
-            dom = (urlparse(url).netloc or "").lower()
-            if not any(a in dom for a in self.allow_domains):
-                return {"action":"block", "reason":"schedule quiet hours", "categories":["schedule"]}
-
+        # Quiet-hours enforcement is per-child/device and lives in the worker gate
+        # (runtime.py), which short-circuits to block before this runs. The helpers
+        # _in_quiet_hours / _schedule_now are shared from there.
         url = event.get("url") or ""
         domain = (urlparse(url).netloc or "").lower()
 
@@ -100,7 +94,9 @@ class PolicyEngine:
         # LLM judge
         if judge_json:
             act = judge_json.get("action","allow")
-            if act not in ("allow","block"):
+            # allow/block/blur pass through; warn/notify are not enforced yet, so
+            # anything else escalates to block.
+            if act not in ("allow","block","blur"):
                 act = "block"
             cats = judge_json.get("categories",[])
             sev  = judge_json.get("severity","low")

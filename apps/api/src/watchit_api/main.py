@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import re
 import time
 import uuid
 from fastapi import Depends, FastAPI, HTTPException
@@ -9,20 +10,30 @@ from starlette.background import BackgroundTask
 from starlette.responses import Response
 from pydantic import BaseModel
 from typing import Literal, Optional
-from watchit_api.schemas import EventInput
+from watchit_api.schemas import ClientLogBatch, EventInput
 from watchit_core.db import db
 from watchit_core.config import settings
-from watchit_agents.runtime import process_event, bus, publish_decision_row
+from watchit_core.logging import bind_log_context, clear_log_context, configure_logging, get_logger, shutdown_logging
+
+# Configure logging before importing the agent modules: graph.py builds the LLM
+# judge/agents at module import and logs `llm_provider_selected` — that line must
+# render through the JSON handler, not structlog's default console renderer.
+configure_logging("api")
+logger = get_logger("watchit.api")
+
+from watchit_agents.runtime import process_event, bus, publish_decision_row, _decision_message_from_row
 from watchit_agents.worker import AgentWorker
 from watchit_learning.guardian_learning import GuardianLearningLoop
-from watchit_api.auth import require_device, require_guardian, require_guardian_stream
-from watchit_core.logging import bind_log_context, clear_log_context, configure_logging, get_logger
+from watchit_api.auth import require_device, require_device_stream, require_guardian, require_guardian_stream
 from watchit_core.url_cache import url_cache_key
 
 from watchit_core.activity_logger import log_service_event, log_service_shutdown
 
-configure_logging("api")
-logger = get_logger("watchit.api")
+# Importing watchit_agents.worker above ran its module-level
+# configure_logging("agent-worker"), which (logging already configured) only
+# rebinds the structlog service context. Restore "api" so API startup/shutdown
+# and other non-request records aren't misclassified as the worker in the drain.
+bind_log_context(service="api")
 
 app = FastAPI(title="WatchIt Local API", version="0.2.0", description="Local-only parental monitoring with Docling OCR and predictive blocking")
 _learning_loop: GuardianLearningLoop | None = None
@@ -52,7 +63,7 @@ async def request_logging_middleware(request: Request, call_next):
         method=request.method,
         path=request.url.path,
     )
-    logger.info("request_started")
+    logger.debug("request_started")
     status_code = 500
     try:
         response: Response = await call_next(request)
@@ -64,7 +75,7 @@ async def request_logging_middleware(request: Request, call_next):
         raise
     finally:
         duration_ms = round((time.perf_counter() - start) * 1000, 2)
-        logger.info("request_finished", status_code=status_code, duration_ms=duration_ms)
+        logger.debug("request_finished", status_code=status_code, duration_ms=duration_ms)
         clear_log_context()
 
 
@@ -106,6 +117,9 @@ async def _shutdown():
         except asyncio.CancelledError:
             pass
         _learning_task = None
+    db.close()
+    # Drain the async log listener last so shutdown records still reach stdout.
+    shutdown_logging()
 
 PIN_POLICY = {"min_length": 4, "max_length": 8, "digits_only": True}
 
@@ -133,6 +147,12 @@ class ChildSettingsPayload(BaseModel):
     age: Optional[int] = None
     name: Optional[str] = None
 
+class ChildCreatePayload(BaseModel):
+    child_id: str
+    name: str
+    strictness: Optional[Literal["lenient","standard","strict"]] = None
+    age: Optional[int] = None
+
 class DecisionOverridePayload(BaseModel):
     action: Literal["allow","warn","blur","block","notify"]
     reason: Optional[str] = None
@@ -153,6 +173,32 @@ class MonitoringPayload(BaseModel):
     child_id: Optional[str] = None
     device_id: Optional[str] = None
 
+class DevicePatchPayload(BaseModel):
+    paused_until_minutes: int
+    pin: Optional[str] = None
+
+class ControlPatchPayload(BaseModel):
+    paused_until_minutes: int
+    pin: Optional[str] = None
+
+class HouseholdCreatePayload(BaseModel):
+    name: str
+
+class ChildMovePayload(BaseModel):
+    target_household_id: str
+
+class MonitoringTogglePayload(BaseModel):
+    enabled: bool
+
+class ScheduleUpsertPayload(BaseModel):
+    schedule_id: Optional[str] = None
+    device_id: Optional[str] = None
+    name: Optional[str] = None
+    days: str
+    quiet_start: str
+    quiet_end: str
+    enabled: bool = True
+
 @app.post("/v1/event")
 async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
     try:
@@ -166,6 +212,9 @@ async def post_event(evt: EventInput, device_ctx=Depends(require_device)):
             logger.info("event_ignored_no_active_session", child_id=device["child_id"], device_id=device["id"])
             raise HTTPException(409, "monitoring is not active for this device")
         event["session_id"] = session["id"]
+        # Snapshot the household monitoring switch at browse time so a toggle after
+        # enqueue can't change how this already-observed visit is handled.
+        event["monitoring_enabled"] = db.is_household_monitoring_enabled(device["household_id"])
         if settings.processing_mode == "sync":
             logger.info("event_processing_sync", child_id=event.get("child_id"), tab_id=event.get("tab_id"), url=event.get("url"))
             return await process_event(event, upgrade=False)
@@ -189,6 +238,7 @@ async def post_event_upgrade(evt: UpgradeInput, device_ctx=Depends(require_devic
             logger.info("event_upgrade_ignored_no_active_session", child_id=device["child_id"], device_id=device["id"])
             raise HTTPException(409, "monitoring is not active for this device")
         event["session_id"] = session["id"]
+        event["monitoring_enabled"] = db.is_household_monitoring_enabled(device["household_id"])
         if settings.processing_mode == "sync":
             logger.info("event_upgrade_processing_sync", event_id=event.get("id"), child_id=event.get("child_id"))
             return await process_event(event, upgrade=True)
@@ -199,14 +249,24 @@ async def post_event_upgrade(evt: UpgradeInput, device_ctx=Depends(require_devic
         logger.exception("event_upgrade_enqueue_failed")
         raise HTTPException(500, "internal error")
 
+@app.get("/v1/event/{event_id}/decision")
+def get_event_decision(event_id: str, device_ctx=Depends(require_device)):
+    # The extension polls this after posting a visit so enforcement no longer
+    # depends on the in-memory SSE push reaching a (possibly evicted) MV3 worker.
+    household_id = device_ctx["device"]["household_id"]
+    row = db.get_decision_by_event(event_id, household_id)
+    if not row:
+        return {"status": "pending"}
+    return {"status": "decided", "decision": _decision_message_from_row(row)}
+
 @app.get("/v1/events")
-async def get_events(child_id: str | None = None, limit: int = 50, guardian_ctx=Depends(require_guardian)):
+def get_events(child_id: str | None = None, limit: int = 50, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     logger.info("events_requested", child_id=child_id, limit=limit)
     return {"events": db.get_recent_events(child_id, limit, household_id)}
 
 @app.get("/v1/decisions")
-async def get_decisions(child_id: str | None = None, limit: int = 50, guardian_ctx=Depends(require_guardian)):
+def get_decisions(child_id: str | None = None, limit: int = 50, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     logger.info("decisions_requested", child_id=child_id, limit=limit)
     return {"decisions": db.get_recent_decisions(child_id, limit, household_id)}
@@ -223,10 +283,41 @@ async def stream_decisions(guardian_ctx=Depends(require_guardian_stream)):
         background=BackgroundTask(bus.unsubscribe, q),
     )
 
+@app.get("/v1/device/stream/decisions")
+async def stream_device_decisions(device_ctx=Depends(require_device_stream)):
+    from watchit_api.sse import sse_generator
+    household_id = device_ctx["device"]["household_id"]
+    q = bus.subscribe()
+    logger.info("device_decision_stream_subscribed")
+    return StreamingResponse(
+        sse_generator(q, household_id=household_id),
+        media_type="text/event-stream",
+        background=BackgroundTask(bus.unsubscribe, q),
+    )
+
 @app.get("/v1/settings/security")
-async def get_security_settings(guardian_ctx=Depends(require_guardian)):
+def get_security_settings(guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
-    return {"parent_pin_set": db.is_parent_pin_set(household_id), "pin_policy": PIN_POLICY}
+    return {
+        "parent_pin_set": db.is_parent_pin_set(household_id),
+        "pin_policy": PIN_POLICY,
+        "monitoring_enabled": db.is_household_monitoring_enabled(household_id),
+    }
+
+@app.post("/v1/control/monitoring")
+async def set_household_monitoring(payload: MonitoringTogglePayload, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    db.set_household_monitoring_enabled(payload.enabled, household_id, guardian_id)
+    db.log_audit(
+        household_id,
+        "household_monitoring_enabled" if payload.enabled else "household_monitoring_disabled",
+        guardian_id=guardian_id,
+        entity_type="household_setting",
+        entity_id="monitoring_enabled",
+    )
+    logger.info("household_monitoring_toggled", enabled=payload.enabled)
+    return {"ok": True, "monitoring_enabled": payload.enabled}
 
 @app.post("/v1/settings/parent-pin")
 async def set_parent_pin(payload: ParentPinPayload, guardian_ctx=Depends(require_guardian)):
@@ -251,63 +342,182 @@ async def set_parent_pin(payload: ParentPinPayload, guardian_ctx=Depends(require
     logger.info("parent_pin_updated", pin_previously_set=pin_exists)
     return {"ok": True, "parent_pin_set": True}
 
-@app.post("/v1/control/pause")
-async def control_pause(body: PausePayload, guardian_ctx=Depends(require_guardian)):
+@app.patch("/v1/control")
+async def patch_control(body: ControlPatchPayload, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     guardian_id = guardian_ctx["guardian"]["id"]
+    if body.paused_until_minutes == 0:
+        db.delete_setting("paused_until", household_id)
+        log_service_event("monitor_resumed")
+        logger.info("monitor_resumed")
+        return {"ok": True, "paused_until": None}
     if not db.is_parent_pin_set(household_id):
         raise HTTPException(409, "parent_pin_required")
-    if not db.verify_parent_pin(body.pin, household_id):
+    if not db.verify_parent_pin(body.pin or "", household_id):
         raise HTTPException(403, "Invalid PIN")
-    import time
-    # If minutes not provided or <=0, treat as an indefinite pause (10-year horizon).
-    minutes = body.minutes if body.minutes is not None else 0
+    minutes = body.paused_until_minutes
     horizon_minutes = minutes if minutes > 0 else 10 * 365 * 24 * 60
-    until_ms = int(time.time()*1000 + horizon_minutes*60*1000)
+    until_ms = int(time.time() * 1000 + horizon_minutes * 60 * 1000)
     db.set_setting("paused_until", str(until_ms), household_id, guardian_id)
-    logger.info(
-        "monitor_paused",
-        minutes_requested=minutes,
-        effective_minutes=horizon_minutes,
-        paused_until_ms=until_ms,
-    )
-    log_service_event(
-        "monitor_paused",
-        {"minutes_requested": minutes, "effective_minutes": horizon_minutes, "paused_until_ms": until_ms},
-    )
+    log_service_event("monitor_paused", {"minutes_requested": minutes, "paused_until_ms": until_ms})
+    logger.info("monitor_paused", minutes_requested=minutes, paused_until_ms=until_ms)
     return {"ok": True, "paused_until": until_ms}
 
-@app.post("/v1/control/resume")
-async def control_resume(body: ResumePayload, guardian_ctx=Depends(require_guardian)):
+client_logger = get_logger("watchit.dashboard-client")
+
+
+@app.post("/v1/client-logs", status_code=202)
+async def ingest_client_logs(payload: ClientLogBatch, guardian_ctx=Depends(require_guardian)):
+    # Dashboard browser logs, shipped here so the log drain captures them too.
+    # Scoped to the authenticated household; no DB write — just re-emit to stdout.
     household_id = guardian_ctx["household"]["id"]
-    db.delete_setting("paused_until", household_id)
-    log_service_event("monitor_resumed")
-    logger.info("monitor_resumed")
+    for entry in payload.entries:
+        method = "warning" if entry.level == "warn" else entry.level
+        getattr(client_logger, method)(
+            entry.message,
+            service="dashboard-client",
+            household_id=household_id,
+            client_ts=entry.ts,
+            context=entry.context,
+        )
+    return {"ok": True, "count": len(payload.entries)}
+
+
+@app.get("/v1/households")
+def list_households(guardian_ctx=Depends(require_guardian)):
+    guardian_id = guardian_ctx["guardian"]["id"]
+    return {
+        "households": db.list_guardian_households(guardian_id),
+        "active_household_id": guardian_ctx["household"]["id"],
+    }
+
+@app.post("/v1/households")
+async def create_household(payload: HouseholdCreatePayload, guardian_ctx=Depends(require_guardian)):
+    guardian_id = guardian_ctx["guardian"]["id"]
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    household = db.create_household(guardian_id, name)
+    db.log_audit(household["id"], "household_created", guardian_id=guardian_id, entity_type="household", entity_id=household["id"])
+    logger.info("household_created", household_id=household["id"])
+    return {"household": household}
+
+@app.post("/v1/children/{child_id}/move")
+async def move_child(child_id: str, payload: ChildMovePayload, guardian_ctx=Depends(require_guardian)):
+    guardian_id = guardian_ctx["guardian"]["id"]
+    child = db.get_child_profile(child_id)
+    if not child:
+        raise HTTPException(404, "child not found")
+    source_household_id = child["household_id"]
+    # Guardian must belong to both the child's current household and the target.
+    if not db.guardian_in_household(guardian_id, source_household_id):
+        raise HTTPException(403, "not a member of the child's household")
+    if not db.guardian_in_household(guardian_id, payload.target_household_id):
+        raise HTTPException(403, "not a member of the target household")
+    if source_household_id == payload.target_household_id:
+        return {"ok": True}
+    if not db.move_child(child_id, source_household_id, payload.target_household_id):
+        raise HTTPException(409, "child could not be moved")
+    db.log_audit(source_household_id, "child_moved", guardian_id=guardian_id, entity_type="child", entity_id=child_id, metadata={"to_household_id": payload.target_household_id})
+    db.log_audit(payload.target_household_id, "child_received", guardian_id=guardian_id, entity_type="child", entity_id=child_id, metadata={"from_household_id": source_household_id})
+    logger.info("child_moved", child_id=child_id, to_household_id=payload.target_household_id)
+    return {"ok": True}
+
+@app.get("/v1/guardian/children")
+def list_guardian_children(guardian_ctx=Depends(require_guardian)):
+    # Every child across the guardian's households, each tagged with household_id +
+    # name, so the household view can offer add (move-in) / remove (move-out).
+    guardian_id = guardian_ctx["guardian"]["id"]
+    return {"children": db.fetch_guardian_children(guardian_id)}
+
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_VALID_DAYS = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+
+@app.get("/v1/children/{child_id}/schedules")
+def list_child_schedules(child_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    if not db.get_child_profile(child_id, household_id):
+        raise HTTPException(404, "child not found")
+    return {"schedules": db.list_schedules(household_id, child_id)}
+
+@app.post("/v1/children/{child_id}/schedules")
+async def upsert_child_schedule(child_id: str, payload: ScheduleUpsertPayload, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if not db.get_child_profile(child_id, household_id):
+        raise HTTPException(404, "child not found")
+    if not _TIME_RE.match(payload.quiet_start) or not _TIME_RE.match(payload.quiet_end):
+        raise HTTPException(400, "quiet_start/quiet_end must be HH:MM")
+    days = [d.strip() for d in payload.days.split(",") if d.strip()]
+    if not days or any(d not in _VALID_DAYS for d in days):
+        raise HTTPException(400, "days must be a comma list of Mon..Sun")
+    if payload.device_id and not any(d["id"] == payload.device_id for d in db.fetch_devices(household_id, child_id)):
+        raise HTTPException(404, "device not found")
+    schedule_id = db.upsert_schedule(
+        household_id,
+        child_id,
+        ",".join(days),
+        payload.quiet_start,
+        payload.quiet_end,
+        device_id=payload.device_id,
+        name=payload.name or "Quiet hours",
+        enabled=payload.enabled,
+        schedule_id=payload.schedule_id,
+    )
+    db.log_audit(household_id, "schedule_saved", guardian_id=guardian_id, entity_type="child_schedule", entity_id=schedule_id)
+    return {"schedule_id": schedule_id}
+
+@app.delete("/v1/schedules/{schedule_id}")
+async def delete_child_schedule(schedule_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if db.delete_schedule(schedule_id, household_id) == 0:
+        raise HTTPException(404, "schedule not found")
+    db.log_audit(household_id, "schedule_deleted", guardian_id=guardian_id, entity_type="child_schedule", entity_id=schedule_id)
     return {"ok": True}
 
 @app.get("/v1/children")
-async def list_children(guardian_ctx=Depends(require_guardian)):
+def list_children(guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     children = db.fetch_children(household_id)
     logger.info("children_requested", count=len(children))
     return {"children": children, "active_child_id": db.get_active_child_id(household_id)}
 
-@app.post("/v1/children/{child_id}/settings")
-async def update_child(child_id: str, payload: ChildSettingsPayload, guardian_ctx=Depends(require_guardian)):
+@app.get("/v1/children/{child_id}/devices")
+def list_child_devices(child_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    if not db.get_child_profile(child_id, household_id):
+        raise HTTPException(404, "child not found")
+    return {"devices": db.fetch_devices(household_id, child_id)}
+
+@app.post("/v1/children")
+async def create_child(payload: ChildCreatePayload, guardian_ctx=Depends(require_guardian)):
     household_id = guardian_ctx["household"]["id"]
     guardian_id = guardian_ctx["guardian"]["id"]
     if payload.age is not None and (payload.age < 3 or payload.age > 18):
         raise HTTPException(400, "age must be between 3 and 18")
-    if payload.strictness is None and payload.age is None and payload.name is None:
-        raise HTTPException(400, "provide strictness, age, and/or name")
-    display_name = payload.name.strip() if payload.name else None
-    db.add_child_profile(child_id, household_id=household_id, name=display_name or child_id)
-    db.update_child_profile(child_id, strictness=payload.strictness, age=payload.age, household_id=household_id, name=display_name)
-    profile = db.get_child_profile(child_id, household_id) or {}
-    db.set_active_child_id(child_id, household_id, guardian_id)
-    db.log_audit(household_id, "child_settings_updated", guardian_id=guardian_id, entity_type="child", entity_id=child_id, metadata=payload.model_dump())
-    logger.info("child_settings_updated", child_id=child_id, strictness=payload.strictness, age=payload.age)
+    display_name = payload.name.strip() if payload.name else ""
+    if not display_name:
+        raise HTTPException(400, "name is required")
+    db.add_child_profile(payload.child_id, household_id=household_id, name=display_name)
+    db.update_child_profile(payload.child_id, strictness=payload.strictness, age=payload.age, household_id=household_id, name=display_name)
+    profile = db.get_child_profile(payload.child_id, household_id) or {}
+    db.set_active_child_id(payload.child_id, household_id, guardian_id)
+    db.log_audit(household_id, "child_created", guardian_id=guardian_id, entity_type="child", entity_id=payload.child_id, metadata=payload.model_dump())
+    logger.info("child_created", child_id=payload.child_id, strictness=payload.strictness, age=payload.age)
     return {"child": profile}
+
+@app.patch("/v1/children/{child_id}")
+async def patch_child(child_id: str, body: ChildSettingsPayload, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if not db.get_child_profile(child_id, household_id):
+        raise HTTPException(404, "child not found")
+    if body.age is not None and (body.age < 3 or body.age > 18):
+        raise HTTPException(400, "age must be between 3 and 18")
+    db.update_child_profile(child_id, strictness=body.strictness, age=body.age, household_id=household_id, name=body.name)
+    db.log_audit(household_id, "child_settings_updated", guardian_id=guardian_id, entity_type="child", entity_id=child_id)
+    return {"ok": True}
 
 @app.post("/v1/decisions/{decision_id}/override")
 async def override_decision(decision_id: str, payload: DecisionOverridePayload, guardian_ctx=Depends(require_guardian)):
@@ -391,7 +601,46 @@ async def redeem_pairing_code(payload: PairingRedeemPayload):
         raise HTTPException(400, "invalid or expired pairing code")
     device = result["device"]
     db.log_audit(device["household_id"], "device_paired", device_id=device["id"], entity_type="device", entity_id=device["id"])
+    reassigned = result.get("reassigned")
+    if reassigned:
+        # Same install_id was stolen from another child: record it on both sides
+        # so the previous owner's guardian has a trail of where the device went.
+        db.log_audit(reassigned["from_household_id"], "device_reassigned", device_id=device["id"], entity_type="device", entity_id=device["id"], metadata=reassigned)
+        if reassigned["to_household_id"] != reassigned["from_household_id"]:
+            db.log_audit(reassigned["to_household_id"], "device_reassigned", device_id=device["id"], entity_type="device", entity_id=device["id"], metadata=reassigned)
+        logger.info("device_reassigned", device_id=device["id"], from_child_id=reassigned["from_child_id"], to_child_id=reassigned["to_child_id"])
     return {"device": device, "device_token": result["device_token"]}
+
+@app.patch("/v1/devices/{device_id}")
+async def patch_device(device_id: str, body: DevicePatchPayload, guardian_ctx=Depends(require_guardian)):
+    import time
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if body.paused_until_minutes <= 0:
+        db.clear_device_pause(household_id, device_id)
+        db.log_audit(household_id, "device_resumed", guardian_id=guardian_id, device_id=device_id, entity_type="device", entity_id=device_id)
+        logger.info("device_resumed", device_id=device_id)
+        return {"ok": True, "paused_until": None}
+    if not db.is_parent_pin_set(household_id):
+        raise HTTPException(409, "parent_pin_required")
+    if not db.verify_parent_pin(body.pin or "", household_id):
+        raise HTTPException(403, "Invalid PIN")
+    until_ms = int(time.time() * 1000 + body.paused_until_minutes * 60 * 1000)
+    if db.set_device_pause(household_id, device_id, until_ms) == 0:
+        raise HTTPException(404, "device not found")
+    db.log_audit(household_id, "device_paused", guardian_id=guardian_id, device_id=device_id, entity_type="device", entity_id=device_id, metadata={"minutes": body.paused_until_minutes})
+    logger.info("device_paused", device_id=device_id, paused_until_ms=until_ms)
+    return {"ok": True, "paused_until": until_ms}
+
+@app.delete("/v1/devices/{device_id}")
+async def revoke_device(device_id: str, guardian_ctx=Depends(require_guardian)):
+    household_id = guardian_ctx["household"]["id"]
+    guardian_id = guardian_ctx["guardian"]["id"]
+    if db.revoke_device(household_id, device_id) == 0:
+        raise HTTPException(404, "device not found")
+    db.log_audit(household_id, "device_revoked", guardian_id=guardian_id, device_id=device_id, entity_type="device", entity_id=device_id)
+    logger.info("device_revoked", device_id=device_id)
+    return {"ok": True}
 
 @app.post("/v1/monitoring/start")
 async def start_monitoring(payload: MonitoringPayload, guardian_ctx=Depends(require_guardian)):
